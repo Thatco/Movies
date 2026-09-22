@@ -1,0 +1,11 @@
+SEResults.txt 
+MovieList2025.json
+MovieList.json
+__pycache__/
+venv/
+Config.local.psd1
+MovieResultsFile.txt
+MovieWithNoResultsFile.txt
+AllResultsFile.txt
+AllMoviesFile.txt
+movie_list_export.py
