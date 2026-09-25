@@ -14,4 +14,11 @@
     AllMoviesFile          = 'C:\Path\To\AllMoviesFile.txt'
     Extensions             = @('mkv', 'mp4', 'avi', 'wmv')
     MaxResultsShown        = 50
+
+    # Optional: leave PlexAccountToken/FriendServerName blank to skip the
+    # remote-server check entirely.
+    PlexAccountToken       = ''
+    PlexClientIdentifier   = 'PowerShell-MovieSearch'
+    FriendServerName       = ''
+    RemoteMoviesFile       = 'C:\Path\To\RemoteMovies.txt'
 }

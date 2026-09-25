@@ -18,7 +18,8 @@ if (-not (Test-Path $ConfigPath)) {
 }
 $Config = Import-PowerShellDataFile -Path $ConfigPath
 
-# Amph. 
+. "$PSScriptRoot\MovieSearchHelpers.ps1"
+. "$PSScriptRoot\API_call.ps1"
 
 # ---------------------------------------------------------------------------
 # Ask which results to include, and which file that corresponds to
@@ -74,21 +75,19 @@ $resultsBuffer = [System.Collections.Generic.List[string]]::new()
 $totalMovies = @($movieTitles).Count
 $i = 0
 
-function Get-SearchFriendlyTitle {
-    <#
-        Filenames on disk rarely keep a title's exact punctuation - colons,
-        ellipses, dashes, commas, and so on tend to get dropped or swapped
-        out entirely when a file is ripped or downloaded. This collapses
-        any run of non-letter, non-digit characters down to a single space,
-        so "Spider-Man: Into the Spider-Verse" becomes
-        "Spider Man Into the Spider Verse" for a fallback search.
+# Get-SearchFriendlyTitle now lives in MovieSearchHelpers.ps1, dot-sourced
+# above, since API_call.ps1 needs the same normalization on Plex titles.
 
-        \p{L} and \p{Nd} match Unicode letters/digits rather than just
-        a-z/0-9, so accented titles aren't mangled in the process.
-    #>
-    param([Parameter(Mandatory)][string]$Title)
-
-    ($Title -replace '[^\p{L}\p{Nd}]+', ' ').Trim()
+# Only attempt the friend's-server check if it's actually configured -
+# keeps this optional rather than a hard requirement to run the script.
+if ($Config.PlexAccountToken -and $Config.FriendServerName) {
+    $remoteTitles = Get-RemoteMovieTitles -AccountToken $Config.PlexAccountToken `
+        -ClientIdentifier $Config.PlexClientIdentifier `
+        -FriendServerName $Config.FriendServerName `
+        -RemoteMoviesFile $Config.RemoteMoviesFile
+}
+else {
+    $remoteTitles = [System.Collections.Generic.HashSet[string]]::new()
 }
 
 # ---------------------------------------------------------------------------
@@ -124,10 +123,19 @@ foreach ($movie in $movieTitles) {
     if ($null -eq $searchResults) {
         $MoviesWithNoResults++
 
+        # Only worth checking the remote set once both local attempts have
+        # already failed - this still counts as "no results" locally (it's
+        # not on your disk), the remote server is just extra context.
+        $onFriendsServer = $remoteTitles.Contains((Get-SearchFriendlyTitle -Title $movie))
+
         # Counters above always update so the summary stays accurate -
         # only whether this gets WRITTEN to the file depends on $ShowMode.
         if ($ShowMode -in 'NoResultsOnly', 'Both') {
-            $resultsBuffer.Add("'$movie' did not return any results.")
+            $line = "'$movie' did not return any results."
+            if ($onFriendsServer) {
+                $line += " (available on $($Config.FriendServerName)'s Plex server)"
+            }
+            $resultsBuffer.Add($line)
             $resultsBuffer.Add('')
         }
     }
@@ -149,8 +157,6 @@ foreach ($movie in $movieTitles) {
         }
     }
 }
-
-# Amph. Amph. 
 
 Write-Progress -Activity "Creating Results List" -Completed
 
