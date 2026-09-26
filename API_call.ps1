@@ -56,8 +56,8 @@ function Get-RemoteMovieTitles {
         # The selected library's key is then used to get the list of movies in that library, 
         # which is then normalized and returned as a hash set of strings.
 
-        $ConfigTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'ConfigToken.txt'
-        $RemoteTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'RemoteToken.txt'
+        $ConfigTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'Config Text Files\ConfigToken.txt'
+        $RemoteTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'Config Text Files\RemoteToken.txt'
         $configToken = @"
 PlexAccountToken       = '$AccountToken'
 PlexClientIdentifier   = '$ClientIdentifier'
