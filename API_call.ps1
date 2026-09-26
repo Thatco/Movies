@@ -49,10 +49,33 @@ function Get-RemoteMovieTitles {
 
         $remoteUri   = $connection.uri
         $remoteToken = $friendServer.accessToken
+        #The idea is to write the token to a file, so that it can be reused in future runs without hitting plex.tv again. The token is written to ConfigToken.txt and RemoteToken.txt in the script's root directory. The remote token is also used to get the list of movie libraries on the friend's server, and then the user is prompted to select which library to use if there are multiple movie libraries. The selected library's key is then used to get the list of movies in that library, which is then normalized and returned as a hash set of strings.
 
+        $ConfigTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'ConfigToken.txt'
+        $RemoteTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'RemoteToken.txt'
+        $configToken = @"
+PlexAccountToken       = '$AccountToken'
+PlexClientIdentifier   = '$ClientIdentifier'
+"@
+        $configToken | Out-File -FilePath $ConfigTokenFile -Encoding utf8
+        $remoteToken | Out-File -FilePath $RemoteTokenFile -Encoding utf8
         $remoteSections = Invoke-RestMethod -Uri "$remoteUri/library/sections/?X-Plex-Token=$remoteToken" -Method Get -Headers @{ 'Accept' = 'application/json' }
-        #$remoteMovieKey = ($remoteSections.MediaContainer.Directory | Where-Object { $_.type -eq 'movie' }).key
-        $remoteMovies   = (Invoke-RestMethod -Uri "$remoteUri/library/sections/1/all?X-Plex-Token=$remoteToken" -Method Get -Headers @{ 'Accept' = 'application/json' }).MediaContainer.Metadata
+        $movieLibraries = @($remoteSections.MediaContainer.Directory | Where-Object { $_.type -eq 'movie' })
+        switch ($movieLibraries.Count) {
+            0 { throw "No movie library was found on '$FriendServerName'." }
+            1 { $remoteMovieKey = $movieLibraries[0].key }
+            default {
+                do {
+                    Write-Host "Multiple movie libraries were found on '$FriendServerName':"
+                    for ($i = 0; $i -lt $movieLibraries.Count; $i++) {
+                        Write-Host "$($i + 1): $($movieLibraries[$i].title)"
+                    }
+                    $choice = Read-Host "Please enter the number of the library to use"
+                } while ($choice -lt 1 -or $choice -gt $movieLibraries.Count)
+                $remoteMovieKey = $movieLibraries[$choice - 1].key
+            }
+        }
+        $remoteMovies   = (Invoke-RestMethod -Uri "$remoteUri/library/sections/$remoteMovieKey/all?X-Plex-Token=$remoteToken" -Method Get -Headers @{ 'Accept' = 'application/json' }).MediaContainer.Metadata
 
         # Dotting straight into .title on the array pulls that property out
         # of every element at once, as a flat string array - no

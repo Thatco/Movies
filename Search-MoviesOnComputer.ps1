@@ -1,3 +1,5 @@
+
+
 <#
     Search-MoviesOnComputer.ps1
 
@@ -24,6 +26,8 @@ $Config = Import-PowerShellDataFile -Path $ConfigPath
 # ---------------------------------------------------------------------------
 # Ask which results to include, and which file that corresponds to
 # ---------------------------------------------------------------------------
+# TODO: Create a short introductory sentence every time the script is run to explain what the program actually does. 
+Write-Host "This script searches for movies on your computer and logs the results."
 do {
     $answer = Read-Host "Would you like to show movies with results (1), movies with no results (2), or both (3)?"
 } while ($answer -notin '1', '2', '3')
@@ -74,6 +78,7 @@ $resultsBuffer = [System.Collections.Generic.List[string]]::new()
 # just its length - no need to hardcode a count or call back into Python.
 $totalMovies = @($movieTitles).Count
 $i = 0
+$onlyOnFriendsServer = 0
 
 # Get-SearchFriendlyTitle now lives in MovieSearchHelpers.ps1, dot-sourced
 # above, since API_call.ps1 needs the same normalization on Plex titles.
@@ -134,6 +139,7 @@ foreach ($movie in $movieTitles) {
             $line = "'$movie' did not return any results."
             if ($onFriendsServer) {
                 $line += " (available on $($Config.FriendServerName)'s Plex server)"
+                $onlyOnFriendsServer++
             }
             $resultsBuffer.Add($line)
             $resultsBuffer.Add('')
@@ -168,3 +174,4 @@ $resultsBuffer | Out-File -FilePath $OutputFile -Encoding utf8 -Width 200
 Write-Host "$(Split-Path $OutputFile -Leaf) updated at $OutputFile"
 Write-Host "There are $MoviesWithNoResults movies with no results."
 Write-Host "There are $MoviesWithResults movies with results."
+Write-Host "There are $onlyOnFriendsServer movies that are only on $($Config.FriendServerName)'s Plex server."
