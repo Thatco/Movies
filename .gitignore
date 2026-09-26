@@ -11,3 +11,5 @@ AllMoviesFile.txt
 API call.ps1
 RemoteMovies.txt
 Output Text Files/
+ConfigToken.txt
+RemoteToken.txt
