@@ -1,4 +1,4 @@
-
+#TODO: Figure out a way to introduce a fourth option in order to make it so there are no search results and also not on the remote server as well. This would be useful for finding movies that are not on the local machine and also not on the remote server.
 
 <#
     Search-MoviesOnComputer.ps1

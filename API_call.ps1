@@ -49,7 +49,12 @@ function Get-RemoteMovieTitles {
 
         $remoteUri   = $connection.uri
         $remoteToken = $friendServer.accessToken
-        #The idea is to write the token to a file, so that it can be reused in future runs without hitting plex.tv again. The token is written to ConfigToken.txt and RemoteToken.txt in the script's root directory. The remote token is also used to get the list of movie libraries on the friend's server, and then the user is prompted to select which library to use if there are multiple movie libraries. The selected library's key is then used to get the list of movies in that library, which is then normalized and returned as a hash set of strings.
+        # The idea is to write the token to a file, so that it can be reused in future runs without hitting plex.tv again. 
+        # The token is written to ConfigToken.txt and RemoteToken.txt in the script's root directory. 
+        # The remote token is also used to get the list of movie libraries on the friend's server, 
+        # and then the user is prompted to select which library to use if there are multiple movie libraries. 
+        # The selected library's key is then used to get the list of movies in that library, 
+        # which is then normalized and returned as a hash set of strings.
 
         $ConfigTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'ConfigToken.txt'
         $RemoteTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'RemoteToken.txt'
