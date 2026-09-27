@@ -85,7 +85,9 @@ $onlyOnFriendsServer = 0
 
 # Only attempt the friend's-server check if it's actually configured -
 # keeps this optional rather than a hard requirement to run the script.
-if ($Config.PlexAccountToken -and $Config.FriendServerName) {
+
+# The Plex server should not be checked if $ShowMode is 'ResultsOnly', since that mode is only concerned with local results. The remote server check is only relevant for movies with no local results, so it should be skipped if the user has chosen to only show movies with results.
+if ($Config.PlexAccountToken -and $Config.FriendServerName -and $ShowMode -notin 'ResultsOnly') {
     $remoteTitles = Get-RemoteMovieTitles -AccountToken $Config.PlexAccountToken `
         -ClientIdentifier $Config.PlexClientIdentifier `
         -FriendServerName $Config.FriendServerName `
@@ -174,4 +176,6 @@ $resultsBuffer | Out-File -FilePath $OutputFile -Encoding utf8 -Width 200
 Write-Host "$(Split-Path $OutputFile -Leaf) updated at $OutputFile"
 Write-Host "There are $MoviesWithNoResults movies with no results."
 Write-Host "There are $MoviesWithResults movies with results."
-Write-Host "There are $onlyOnFriendsServer movies that are only on $($Config.FriendServerName)'s Plex server."
+if ($ShowMode -in 'NoResultsOnly', 'Both' -and $Config.FriendServerName) {
+    Write-Host "There are $onlyOnFriendsServer movies that are only on $($Config.FriendServerName)'s Plex server."
+}
