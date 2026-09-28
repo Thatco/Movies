@@ -1,16 +1,8 @@
 SEResults.txt 
-MovieList2025.json
 MovieList.json
 __pycache__/
 venv/
 Config.local.psd1
-MovieResultsFile.txt
-MovieWithNoResultsFile.txt
-AllResultsFile.txt
-AllMoviesFile.txt
 API call.ps1
-RemoteMovies.txt
 Output Text Files/
-ConfigToken.txt
-RemoteToken.txt
-MovieWithNoLocalAndRemoteResultsFile.txt
+Config Text Files/
