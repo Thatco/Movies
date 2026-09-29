@@ -181,6 +181,9 @@ foreach ($movie in $movieTitles) {
         if ($matchedTitle -ne $movie) {
             $line += " (matched via cleaned title: '$matchedTitle')"
         }
+        if ($onFriendsServer) {
+            $line += " (available on $($Config.FriendServerName)'s Plex server)"
+        }
 
         $resultsBuffer.Add($line)
         $resultsBuffer.Add(('-' * 68))
