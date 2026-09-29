@@ -1,6 +1,7 @@
 """
-Export movie titles from a Letterboxd `ratings.csv` export into a JSON
-array, for consumption by Search-MoviesOnComputer.ps1.
+Export movie titles from a Letterboxd `ratings.csv` export, merged with
+titles from `diary.csv` in the same folder, into a JSON array for
+consumption by Search-MoviesOnComputer.ps1.
 
 Using JSON here (instead of joining/splitting a single string) means we
 never have to worry about apostrophes, commas, or quotes inside a movie
@@ -35,7 +36,7 @@ def find_csv_path() -> Path:
 
 
 def load_movie_titles(csv_path: Path) -> list[str]:
-    """Read the 'Name' column out of a standard Letterboxd ratings.csv."""
+    """Read the 'Name' column out of a standard Letterboxd-format CSV."""
     with csv_path.open(encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None or "Name" not in reader.fieldnames:
@@ -46,9 +47,32 @@ def load_movie_titles(csv_path: Path) -> list[str]:
         return [row["Name"].strip() for row in reader if row.get("Name")]
 
 
+def load_diary_titles(ratings_csv_path: Path) -> list[str]:
+    """
+    Read titles out of diary.csv, if it exists alongside ratings.csv in
+    the same export folder. Same column layout as ratings.csv (Name is
+    the field we care about either way), so load_movie_titles handles it
+    directly - this just locates the file and tolerates it being absent.
+    """
+    diary_path = ratings_csv_path.with_name("diary.csv")
+    if not diary_path.exists():
+        print(f"No diary.csv found next to {ratings_csv_path.name} - skipping it.")
+        return []
+    return load_movie_titles(diary_path)
+
+
+def dedupe_preserve_order(titles: list[str]) -> list[str]:
+    """Drop exact-duplicate titles (e.g. logged in both files) while
+    keeping first-seen order - dict keys preserve insertion order in
+    Python, so this is a simple, fast way to dedupe without sorting."""
+    return list(dict.fromkeys(titles))
+
+
 def main() -> None:
     csv_path = find_csv_path()
     titles = load_movie_titles(csv_path)
+    titles += load_diary_titles(csv_path)
+    titles = dedupe_preserve_order(titles)
 
     OUTPUT_PATH.write_text(
         json.dumps(titles, ensure_ascii=False, indent=2), encoding="utf-8"

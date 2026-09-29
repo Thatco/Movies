@@ -2,34 +2,71 @@
     API_call.ps1
 
     Plex API functions. Dot-source this file, then call
-    Get-RemoteMovieTitles - don't run this file directly, it no longer does
-    anything on its own:
+    Get-RemoteMovieAvailability - don't run this file directly, it no
+    longer does anything on its own:
 
         . .\API_call.ps1
-        $titles = Get-RemoteMovieTitles -AccountToken $Config.PlexAccountToken `
+        $availability = Get-RemoteMovieAvailability -AccountToken $Config.PlexAccountToken `
             -ClientIdentifier $Config.PlexClientIdentifier `
-            -FriendServerName $Config.FriendServerName `
-            -RemoteMoviesFile $Config.RemoteMoviesFile
+            -FriendServerNames $Config.FriendServerNames `
+            -RemoteMoviesFolder $Config.RemoteMoviesFolder `
+            -LibraryDefaultsFile $Config.LibraryDefaultsFile
 #>
 
 . "$PSScriptRoot\MovieSearchHelpers.ps1"
 
-function Get-RemoteMovieTitles {
+function Get-LibraryDefaults {
+    <# Reads the saved server-name -> library-key map, or an empty
+       hashtable if nothing's been saved yet. #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (Test-Path $Path) {
+        return Import-PowerShellDataFile -Path $Path
+    }
+    return @{}
+}
+
+function Save-LibraryDefaults {
+    <# PowerShell has Import-PowerShellDataFile built in, but no matching
+       Export- counterpart, so this hand-writes the .psd1 text - same
+       format Config.local.psd1 already uses, just a flat string -> string
+       map instead of the bigger settings hashtable. #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable]$Defaults
+    )
+
+    $folder = Split-Path -Path $Path -Parent
+    if ($folder -and -not (Test-Path $folder)) {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    }
+
+    $lines = foreach ($key in $Defaults.Keys) {
+        "    '$key' = '$($Defaults[$key])'"
+    }
+    "@{`n$($lines -join "`n")`n}" | Out-File -FilePath $Path -Encoding utf8
+}
+
+function Get-RemoteMovieTitlesForServer {
     <#
-        Returns a set of cleaned/normalized movie titles available on a
-        remote (e.g. a friend's) Plex server, for use as a fallback lookup
-        once a local search has already come up empty for both the exact
-        and cleaned title. Tries a live check via the Plex API first; if
-        that fails for any reason - the server's offline, the network's
-        down, a token expired - falls back to the last cached
-        RemoteMoviesFile on disk instead, so a temporary outage on their
-        end doesn't break your whole run.
+        Returns cleaned/normalized movie titles available on ONE remote
+        Plex server. Tries a live check via the Plex API first; if that
+        fails for any reason - the server's offline, the network's down,
+        a token expired - falls back to the last cached RemoteMoviesFile
+        on disk instead, so a temporary outage on their end doesn't break
+        the whole run.
+
+        If the server has more than one movie library, the choice is
+        asked once and then remembered in LibraryDefaultsFile (keyed by
+        server name) so future runs - for this server or any other in
+        FriendServerNames - don't ask again.
     #>
     param(
         [Parameter(Mandatory)][string]$AccountToken,
         [Parameter(Mandatory)][string]$ClientIdentifier,
         [Parameter(Mandatory)][string]$FriendServerName,
-        [Parameter(Mandatory)][string]$RemoteMoviesFile
+        [Parameter(Mandatory)][string]$RemoteMoviesFile,
+        [Parameter(Mandatory)][string]$LibraryDefaultsFile
     )
 
     try {
@@ -49,13 +86,9 @@ function Get-RemoteMovieTitles {
 
         $remoteUri   = $connection.uri
         $remoteToken = $friendServer.accessToken
-        # The idea is to write the token to a file, so that it can be reused in future runs without hitting plex.tv again. 
-        # The token is written to ConfigToken.txt and RemoteToken.txt in the script's root directory. 
-        # The remote token is also used to get the list of movie libraries on the friend's server, 
-        # and then the user is prompted to select which library to use if there are multiple movie libraries. 
-        # The selected library's key is then used to get the list of movies in that library, 
-        # which is then normalized and returned as a hash set of strings.
 
+        # Kept from an earlier experiment - restates values already passed
+        # in as parameters, nothing reads these back yet.
         $ConfigTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'Config Text Files\ConfigToken.txt'
         $RemoteTokenFile = Join-Path -Path $PSScriptRoot -ChildPath 'Config Text Files\RemoteToken.txt'
         $configToken = @"
@@ -64,23 +97,42 @@ PlexClientIdentifier   = '$ClientIdentifier'
 "@
         $configToken | Out-File -FilePath $ConfigTokenFile -Encoding utf8
         $remoteToken | Out-File -FilePath $RemoteTokenFile -Encoding utf8
+
         $remoteSections = Invoke-RestMethod -Uri "$remoteUri/library/sections/?X-Plex-Token=$remoteToken" -Method Get -Headers @{ 'Accept' = 'application/json' }
         $movieLibraries = @($remoteSections.MediaContainer.Directory | Where-Object { $_.type -eq 'movie' })
-        switch ($movieLibraries.Count) {
-            0 { throw "No movie library was found on '$FriendServerName'." }
-            1 { $remoteMovieKey = $movieLibraries[0].key }
-            default {
-                do {
-                    Write-Host "Multiple movie libraries were found on '$FriendServerName':"
-                    for ($i = 0; $i -lt $movieLibraries.Count; $i++) {
-                        Write-Host "$($i + 1): $($movieLibraries[$i].title)"
-                    }
-                    $choice = Read-Host "Please enter the number of the library to use"
-                } while ($choice -lt 1 -or $choice -gt $movieLibraries.Count)
-                $remoteMovieKey = $movieLibraries[$choice - 1].key
-            }
+
+        if ($movieLibraries.Count -eq 0) {
+            throw "No movie library was found on '$FriendServerName'."
         }
-        $remoteMovies   = (Invoke-RestMethod -Uri "$remoteUri/library/sections/$remoteMovieKey/all?X-Plex-Token=$remoteToken" -Method Get -Headers @{ 'Accept' = 'application/json' }).MediaContainer.Metadata
+
+        # A previously-saved choice for THIS server wins, if one exists
+        # and still matches a library that's actually there.
+        $libraryDefaults = Get-LibraryDefaults -Path $LibraryDefaultsFile
+        $savedKey     = $libraryDefaults[$FriendServerName]
+        $savedLibrary = $movieLibraries | Where-Object { $_.key -eq $savedKey } | Select-Object -First 1
+
+        if ($savedLibrary) {
+            $remoteMovieKey = $savedLibrary.key
+        }
+        elseif ($movieLibraries.Count -eq 1) {
+            $remoteMovieKey = $movieLibraries[0].key
+        }
+        else {
+            do {
+                Write-Host "Multiple movie libraries were found on '$FriendServerName':"
+                for ($j = 0; $j -lt $movieLibraries.Count; $j++) {
+                    Write-Host "$($j + 1): $($movieLibraries[$j].title)"
+                }
+                $choice = Read-Host "Please enter the number of the library to use (this will be remembered next time)"
+            } while ($choice -lt 1 -or $choice -gt $movieLibraries.Count)
+
+            $remoteMovieKey = $movieLibraries[$choice - 1].key
+
+            $libraryDefaults[$FriendServerName] = $remoteMovieKey
+            Save-LibraryDefaults -Path $LibraryDefaultsFile -Defaults $libraryDefaults
+        }
+
+        $remoteMovies = (Invoke-RestMethod -Uri "$remoteUri/library/sections/$remoteMovieKey/all?X-Plex-Token=$remoteToken" -Method Get -Headers @{ 'Accept' = 'application/json' }).MediaContainer.Metadata
 
         # Dotting straight into .title on the array pulls that property out
         # of every element at once, as a flat string array - no
@@ -97,17 +149,59 @@ PlexClientIdentifier   = '$ClientIdentifier'
         Write-Warning "Live check of '$FriendServerName' failed ($($_.Exception.Message)) - falling back to the cached list."
 
         if (-not (Test-Path $RemoteMoviesFile)) {
-            Write-Warning "No cached file found at $RemoteMoviesFile either - remote matching will be skipped this run."
-            return [System.Collections.Generic.HashSet[string]]::new()
+            Write-Warning "No cached file found at $RemoteMoviesFile either - '$FriendServerName' will be skipped this run."
+            return @()
         }
 
         $titles = Get-Content -Path $RemoteMoviesFile
     }
 
-    $normalized = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($title in $titles) {
-        [void]$normalized.Add((Get-SearchFriendlyTitle -Title $title))
+    return $titles | ForEach-Object { Get-SearchFriendlyTitle -Title $_ }
+}
+
+function Get-RemoteMovieAvailability {
+    <#
+        Checks every server in FriendServerNames and returns a hashtable
+        mapping each normalized movie title to the LIST of friend server
+        names it's available on (so "found on 2 of your 3 friends'
+        servers" is answerable, not just "found on at least one").
+
+        Each server is checked independently - one being unreachable
+        (falling back to its own cache, or being skipped entirely if even
+        that's missing) doesn't stop the others from being checked.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AccountToken,
+        [Parameter(Mandatory)][string]$ClientIdentifier,
+        [Parameter(Mandatory)][string[]]$FriendServerNames,
+        [Parameter(Mandatory)][string]$RemoteMoviesFolder,
+        [Parameter(Mandatory)][string]$LibraryDefaultsFile
+    )
+
+    if (-not (Test-Path $RemoteMoviesFolder)) {
+        New-Item -ItemType Directory -Path $RemoteMoviesFolder -Force | Out-Null
     }
 
-    return $normalized
+    $availability = @{}
+
+    foreach ($serverName in $FriendServerNames) {
+        # One cache file per server, named after it - this is also why a
+        # single RemoteMoviesFile setting became a RemoteMoviesFolder one.
+        $cacheFile = Join-Path -Path $RemoteMoviesFolder -ChildPath "$serverName.txt"
+
+        $titles = Get-RemoteMovieTitlesForServer -AccountToken $AccountToken `
+            -ClientIdentifier $ClientIdentifier `
+            -FriendServerName $serverName `
+            -RemoteMoviesFile $cacheFile `
+            -LibraryDefaultsFile $LibraryDefaultsFile
+
+        foreach ($title in $titles) {
+            if (-not $availability.ContainsKey($title)) {
+                $availability[$title] = [System.Collections.Generic.List[string]]::new()
+            }
+            $availability[$title].Add($serverName)
+        }
+    }
+
+    return $availability
 }

@@ -42,7 +42,7 @@ if (-not $ShowMode) {
     Write-Host "  1) Movies with results"
     Write-Host "  2) Movies with no results"
     Write-Host "  3) Both"
-    Write-Host "  4) Movies not on your computer AND not on $($Config.FriendServerName)'s Plex server"
+    Write-Host "  4) Movies not on your computer AND not on $(Format-ServerNameList -Names $Config.FriendServerNames -Conjunction 'or') Plex server"
 
     do {
         $answer = Read-Host "Choose an option (1-4)"
@@ -104,19 +104,22 @@ $i = 0
 # above, since API_call.ps1 needs the same normalization on Plex titles.
 
 # Skip the remote check entirely for ResultsOnly - it's irrelevant to that
-# mode, and this saves an API call when you don't need it. $remoteCheckRan
+# mode, and this saves API calls when you don't need them. $remoteCheckRan
 # is reused below to decide whether the summary's friend's-server numbers
 # actually mean anything for this run.
-$remoteCheckRan = [bool]($Config.PlexAccountToken -and $Config.FriendServerName -and $ShowMode -ne 'ResultsOnly')
+$remoteCheckRan = [bool]($Config.PlexAccountToken -and $Config.FriendServerNames -and $Config.FriendServerNames.Count -gt 0 -and $ShowMode -ne 'ResultsOnly')
 
 if ($remoteCheckRan) {
-    $remoteTitles = Get-RemoteMovieTitles -AccountToken $Config.PlexAccountToken `
+    # A hashtable: normalized title -> list of friend server names that
+    # have it, aggregated across every server in FriendServerNames.
+    $remoteAvailability = Get-RemoteMovieAvailability -AccountToken $Config.PlexAccountToken `
         -ClientIdentifier $Config.PlexClientIdentifier `
-        -FriendServerName $Config.FriendServerName `
-        -RemoteMoviesFile $Config.RemoteMoviesFile
+        -FriendServerNames $Config.FriendServerNames `
+        -RemoteMoviesFolder $Config.RemoteMoviesFolder `
+        -LibraryDefaultsFile $Config.LibraryDefaultsFile
 }
 else {
-    $remoteTitles = [System.Collections.Generic.HashSet[string]]::new()
+    $remoteAvailability = @{}
 }
 
 # ---------------------------------------------------------------------------
@@ -156,7 +159,8 @@ foreach ($movie in $movieTitles) {
     # set inside the "not found" branch, a movie that WAS found locally
     # skipped the assignment and silently inherited whatever value was
     # left over from a completely different, earlier movie's iteration.
-    $onFriendsServer = $remoteTitles.Contains((Get-SearchFriendlyTitle -Title $movie))
+    $serverNames     = $remoteAvailability[(Get-SearchFriendlyTitle -Title $movie)]
+    $onFriendsServer = $serverNames -and $serverNames.Count -gt 0
 
     if ($foundLocally) {
         $MoviesWithResults++
@@ -182,7 +186,7 @@ foreach ($movie in $movieTitles) {
             $line += " (matched via cleaned title: '$matchedTitle')"
         }
         if ($onFriendsServer) {
-            $line += " (available on $($Config.FriendServerName)'s Plex server)"
+            $line += " (available on $(Format-ServerNameList -Names $serverNames) Plex server)"
         }
 
         $resultsBuffer.Add($line)
@@ -194,14 +198,14 @@ foreach ($movie in $movieTitles) {
     if (-not $foundLocally -and $ShowMode -in 'NoResultsOnly', 'Both') {
         $line = "'$movie' did not return any results."
         if ($onFriendsServer) {
-            $line += " (available on $($Config.FriendServerName)'s Plex server)"
+            $line += " (available on $(Format-ServerNameList -Names $serverNames) Plex server)"
         }
         $resultsBuffer.Add($line)
         $resultsBuffer.Add('')
     }
 
     if (-not $foundLocally -and -not $onFriendsServer -and $ShowMode -eq 'NoLocalAndRemoteResultsOnly') {
-        $resultsBuffer.Add("'$movie' was not found on your computer and is also not available on $($Config.FriendServerName)'s Plex server.")
+        $resultsBuffer.Add("'$movie' was not found on your computer and is also not available on $(Format-ServerNameList -Names $Config.FriendServerNames -Conjunction 'or') Plex server.")
         $resultsBuffer.Add('')
     }
 }
@@ -217,6 +221,7 @@ Write-Host "$(Split-Path $OutputFile -Leaf) updated at $OutputFile"
 Write-Host "There are $MoviesWithResults of $totalMovies movies with results."
 Write-Host "There are $MoviesWithNoResults of $totalMovies movies with no results."
 if ($remoteCheckRan) {
-    Write-Host "  - $MoviesOnlyOnFriendsServer of $totalMovies movies are available on $($Config.FriendServerName)'s Plex server."
-    Write-Host "  - $MoviesWithNoLocalAndRemoteResults of $totalMovies movies are not on $($Config.FriendServerName)'s Plex server either."
+    $serverList = Format-ServerNameList -Names $Config.FriendServerNames
+    Write-Host "  - $MoviesOnlyOnFriendsServer of $totalMovies movies are available on $serverList Plex server."
+    Write-Host "  - $MoviesWithNoLocalAndRemoteResults of $totalMovies movies are not on $serverList Plex server either."
 }

@@ -24,3 +24,32 @@ function Get-SearchFriendlyTitle {
 
     ($Title -replace '[^\p{L}\p{Nd}]+', ' ').Trim()
 }
+
+function Format-ServerNameList {
+    <#
+        Joins server names into a natural, Oxford-comma phrase, each with
+        a possessive 's already attached:
+            @('Friend1')                    -> "Friend1's"
+            @('Friend1','Friend2')          -> "Friend1's and Friend2's"
+            @('Friend1','Friend2','Friend3') -> "Friend1's, Friend2's, and Friend3's"
+
+        -Conjunction 'or' swaps the final joiner, for a negative-mode
+        phrasing like "not on Friend1's, Friend2's, or Friend3's server."
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Names,
+        [string]$Conjunction = 'and'
+    )
+
+    $possessives = $Names | ForEach-Object { "$_'s" }
+
+    switch ($possessives.Count) {
+        0 { return '' }
+        1 { return $possessives }
+        2 { return "$($possessives[0]) $Conjunction $($possessives[1])" }
+        default {
+            $allButLast = $possessives[0..($possessives.Count - 2)] -join ', '
+            return "$allButLast, $Conjunction $($possessives[-1])"
+        }
+    }
+}
