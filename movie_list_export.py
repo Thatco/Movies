@@ -18,7 +18,7 @@ import easygui
 # Update this each time you download a fresh export from Letterboxd,
 # or just let the file picker below handle it.
 DEFAULT_CSV_PATH = Path(
-    r"C:\Users\Amphy\Downloads\letterboxd-thatco-2026-09-22-02-28-utc\ratings.csv"
+    r"C:\Users\Amphy\Programming Projects\MovieSearch\letterboxd-thatco-2026-09-22-02-28-utc\ratings.csv"
 )
 
 OUTPUT_PATH = Path(__file__).with_name("MovieList.json")
@@ -54,11 +54,24 @@ def load_diary_titles(ratings_csv_path: Path) -> list[str]:
     the field we care about either way), so load_movie_titles handles it
     directly - this just locates the file and tolerates it being absent.
     """
-    diary_path = ratings_csv_path.with_name("diary.csv")
+    diary_path = ratings_csv_path.with_name("OrphanedDiary.csv")
     if not diary_path.exists():
         print(f"No diary.csv found next to {ratings_csv_path.name} - skipping it.")
         return []
     return load_movie_titles(diary_path)
+
+def load_watchlist_titles(watchlist_csv_path: Path) -> list[str]:
+    """
+    Read titles out of watchlist.csv, if it exists alongside ratings.csv in
+    the same export folder. Same column layout as ratings.csv (Name is
+    the field we care about either way), so load_movie_titles handles it
+    directly - this just locates the file and tolerates it being absent.
+    """
+    watchlist_path = watchlist_csv_path.with_name("watchlist.csv")
+    if not watchlist_path.exists():
+        print(f"No watchlist.csv found next to {watchlist_csv_path.name} - skipping it.")
+        return []
+    return load_movie_titles(watchlist_path)
 
 
 def dedupe_preserve_order(titles: list[str]) -> list[str]:
@@ -72,6 +85,7 @@ def main() -> None:
     csv_path = find_csv_path()
     titles = load_movie_titles(csv_path)
     titles += load_diary_titles(csv_path)
+    titles += load_watchlist_titles(csv_path)
     titles = dedupe_preserve_order(titles)
 
     OUTPUT_PATH.write_text(
