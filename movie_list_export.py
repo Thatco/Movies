@@ -19,7 +19,7 @@ from pathlib import Path
 import easygui
 
 DEFAULT_CSV_PATH = Path(
-    r"C:\Users\Amphy\Programming Projects\MovieSearch\letterboxd-thatco-2026-09-22-02-28-utc\ratings.csv"
+    r"C:\Users\Amphy\Programming Projects\MovieSearch\Exported from Letterboxd\letterboxd-thatco-2026-10-01-21-47-utc\ratings.csv"
 )
 
 OUTPUT_PATH = Path(__file__).with_name("MovieList.json")
