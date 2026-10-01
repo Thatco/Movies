@@ -137,7 +137,7 @@ foreach ($movie in $movieTitles) {
             -PercentComplete (($i / $totalMovies) * 100)
     }
 
-    $searchResults = Search-Everything -Global -Filter $movie -Extension $Config.Extensions
+    $searchResults = Search-Everything -Global -Filter $movie -Extension $Config.Extensions -MatchWholeWord
     $matchedTitle  = $movie
 
     # Exact title came up empty - retry once with punctuation stripped out,
