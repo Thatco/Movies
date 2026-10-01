@@ -18,7 +18,6 @@ param(
     [string]$ShowMode
 )
 
-
 # ---------------------------------------------------------------------------
 # Configuration - personal paths live in Config.local.psd1 (gitignored),
 # so this script has nothing private baked into it and is safe to make
@@ -32,6 +31,32 @@ $Config = Import-PowerShellDataFile -Path $ConfigPath
 
 . "$PSScriptRoot\MovieSearchHelpers.ps1"
 . "$PSScriptRoot\API_call.ps1"
+
+function Test-ConfidentMatch {
+    <#
+        A result is "confident" when its filename contains both the
+        movie's release year AND a resolution tag (480p/720p/1080p/2160p/
+        4K) - title text alone is what short titles like "M" or "Pi"
+        abuse to produce false positives, but a year + resolution
+        combination is much harder to match by accident.
+
+        This is a floor, not a ceiling: plenty of correctly-named rips
+        won't have a resolution tag at all, so a FALSE result here just
+        means "unverified," not "wrong."
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string]$Year
+    )
+
+    if (-not $Year) {
+        return $false
+    }
+
+    $hasYear       = $FilePath -match [regex]::Escape($Year)
+    $hasResolution = $FilePath -match '(?i)\b(480p|720p|1080p|2160p|4k)\b'
+    return $hasYear -and $hasResolution
+}
 
 # ---------------------------------------------------------------------------
 # Ask which results to include, and which file that corresponds to
@@ -82,9 +107,9 @@ if (-not (Test-Path $Config.MovieListJson)) {
     throw "Movie list JSON not found at $($Config.MovieListJson). Did the Python script run correctly?"
 }
 
-# ConvertFrom-Json handles apostrophes/quotes/commas in titles natively -
-# no more regex title-extraction needed.
-$movieTitles = Get-Content -Path $Config.MovieListJson -Raw | ConvertFrom-Json
+# Each entry is now {Title, Year} rather than a bare string, so the
+# confidence check below has a year to work with.
+$movieEntries = Get-Content -Path $Config.MovieListJson -Raw | ConvertFrom-Json
 
 $MoviesWithNoResults = 0
 $MoviesWithResults   = 0
@@ -95,19 +120,20 @@ $MoviesWithNoLocalAndRemoteResults  = 0
 # of opening/closing the output file on every single Out-File -Append call.
 $resultsBuffer = [System.Collections.Generic.List[string]]::new()
 
-# $movieTitles already came from the JSON we just parsed, so the total is
+# $movieEntries already came from the JSON we just parsed, so the total is
 # just its length - no need to hardcode a count or call back into Python.
-$totalMovies = @($movieTitles).Count
+$totalMovies = @($movieEntries).Count
 $i = 0
 
-# Get-SearchFriendlyTitle now lives in MovieSearchHelpers.ps1, dot-sourced
-# above, since API_call.ps1 needs the same normalization on Plex titles.
+# Get-SearchFriendlyTitle and Format-ServerNameList live in
+# MovieSearchHelpers.ps1, dot-sourced above.
 
-# Skip the remote check entirely for ResultsOnly - it's irrelevant to that
-# mode, and this saves API calls when you don't need them. $remoteCheckRan
-# is reused below to decide whether the summary's friend's-server numbers
-# actually mean anything for this run.
-$remoteCheckRan = [bool]($Config.PlexAccountToken -and $Config.FriendServerNames -and $Config.FriendServerNames.Count -gt 0 -and $ShowMode -ne 'ResultsOnly')
+# $remoteCheckRan is reused below to decide whether the summary's
+# friend's-server numbers actually mean anything for this run. Runs for
+# every mode, ResultsOnly included - even a movie found locally is worth
+# cross-referencing, since a local "match" can itself be a false
+# positive, and remote availability is a useful data point either way.
+$remoteCheckRan = [bool]($Config.PlexAccountToken -and $Config.FriendServerNames -and $Config.FriendServerNames.Count -gt 0)
 
 if ($remoteCheckRan) {
     # A hashtable: normalized title -> list of friend server names that
@@ -125,7 +151,7 @@ else {
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
-foreach ($movie in $movieTitles) {
+foreach ($movieEntry in $movieEntries) {
     $i++
 
     # Only redraw every 5 movies (or on the last one). Write-Progress on
@@ -137,29 +163,57 @@ foreach ($movie in $movieTitles) {
             -PercentComplete (($i / $totalMovies) * 100)
     }
 
+    $movie = $movieEntry.Title
+    $year  = $movieEntry.Year
+
+    # -MatchWholeWord requires each search term to match a standalone
+    # word/token in the filename, not just appear as a substring - this
+    # is what keeps "M" from matching "Madness.mkv".
     $searchResults = Search-Everything -Global -Filter $movie -Extension $Config.Extensions -MatchWholeWord
     $matchedTitle  = $movie
 
-    # Exact title came up empty - retry once with punctuation stripped out,
-    # since that's usually why a file that's clearly there doesn't match.
+    # Exact title came up empty - retry once with punctuation stripped
+    # out, since that's usually why a file that's clearly there doesn't
+    # match.
     if ($null -eq $searchResults) {
         $cleanTitle = Get-SearchFriendlyTitle -Title $movie
         if ($cleanTitle -and $cleanTitle -ne $movie) {
-            $searchResults = Search-Everything -Global -Filter $cleanTitle -Extension $Config.Extensions
+            $searchResults = Search-Everything -Global -Filter $cleanTitle -Extension $Config.Extensions -MatchWholeWord
             if ($searchResults) {
                 $matchedTitle = $cleanTitle
             }
         }
     }
 
+    # Still nothing, and the title itself contains an alternate-title
+    # separator (e.g. "La battaglia di Algeri / The Battle of Algiers") -
+    # try each side on its own, since your local file is likely named
+    # after only one of them. This only helps when Letterboxd's own title
+    # text actually contains both forms; a single foreign-language title
+    # with no English text in it at all isn't something string matching
+    # can solve.
+    if ($null -eq $searchResults -and $movie -match ' / ') {
+        foreach ($titlePart in ($movie -split ' / ')) {
+            $titlePart = $titlePart.Trim()
+            $cleanPart = Get-SearchFriendlyTitle -Title $titlePart
+            if (-not $cleanPart) {
+                continue
+            }
+            $searchResults = Search-Everything -Global -Filter $cleanPart -Extension $Config.Extensions -MatchWholeWord
+            if ($searchResults) {
+                $matchedTitle = $titlePart
+                break
+            }
+        }
+    }
+
     $foundLocally = $null -ne $searchResults
 
-    # Computed fresh every single iteration, regardless of $foundLocally.
-    # This is what was actually going wrong before: when this was only
-    # set inside the "not found" branch, a movie that WAS found locally
-    # skipped the assignment and silently inherited whatever value was
-    # left over from a completely different, earlier movie's iteration.
-    $serverNames     = $remoteAvailability[(Get-SearchFriendlyTitle -Title $movie)]
+    # Computed fresh every single iteration, regardless of $foundLocally,
+    # so a movie that WAS found locally can never inherit a stale value
+    # left over from a different, earlier movie's iteration.
+    $normalizedTitle = Get-SearchFriendlyTitle -Title $movie
+    $serverNames     = $remoteAvailability[$normalizedTitle]
     $onFriendsServer = $serverNames -and $serverNames.Count -gt 0
 
     if ($foundLocally) {
@@ -179,9 +233,18 @@ foreach ($movie in $movieTitles) {
     # booleans - none of them live nested inside another mode's branch,
     # so every mode always sees the exact same, always-current state.
     if ($foundLocally -and $ShowMode -in 'ResultsOnly', 'Both') {
-        $resultCount = @($searchResults).Count
-        $resultWord  = if ($resultCount -eq 1) { 'result' } else { 'results' }
+        $resultsToShow     = @($searchResults | Select-Object -Last $Config.MaxResultsShown)
+        $confidentResults  = @($resultsToShow | Where-Object { Test-ConfidentMatch -FilePath $_ -Year $year })
+        $resultCount       = @($searchResults).Count
+        $resultWord        = if ($resultCount -eq 1) { 'result' } else { 'results' }
+
         $line = "'$movie' returned $resultCount $resultWord."
+        if ($confidentResults.Count -gt 0) {
+            $line += " (confident match - title, year & resolution all present)"
+        }
+        else {
+            $line += " (low confidence - verify manually)"
+        }
         if ($matchedTitle -ne $movie) {
             $line += " (matched via cleaned title: '$matchedTitle')"
         }
@@ -191,7 +254,14 @@ foreach ($movie in $movieTitles) {
 
         $resultsBuffer.Add($line)
         $resultsBuffer.Add(('-' * 68))
-        $resultsBuffer.AddRange([string[]]($searchResults | Select-Object -Last $Config.MaxResultsShown))
+        foreach ($result in $resultsToShow) {
+            if ($confidentResults -contains $result) {
+                $resultsBuffer.Add("  * $result")
+            }
+            else {
+                $resultsBuffer.Add("  $result")
+            }
+        }
         $resultsBuffer.Add('')
     }
 
