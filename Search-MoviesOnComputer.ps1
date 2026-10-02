@@ -4,7 +4,7 @@
     Regenerates a movie list from your Letterboxd export (via
     movie_list_export.py), then searches for each title on disk using
     the "Everything" search tool (Search-Everything module), logging
-    results to a text file.
+    results to a Markdown file.
 
     Run it interactively (it'll prompt for a mode), or pass -ShowMode
     directly for scripted/scheduled runs:
@@ -32,30 +32,31 @@ $Config = Import-PowerShellDataFile -Path $ConfigPath
 . "$PSScriptRoot\MovieSearchHelpers.ps1"
 . "$PSScriptRoot\API_call.ps1"
 
-function Test-ConfidentMatch {
+function Get-MatchConfidence {
     <#
-        A result is "confident" when its filename contains both the
+        Returns 'Strong' when a result's filename contains both the
         movie's release year AND a resolution tag (480p/720p/1080p/2160p/
-        4K) - title text alone is what short titles like "M" or "Pi"
-        abuse to produce false positives, but a year + resolution
-        combination is much harder to match by accident.
-
-        This is a floor, not a ceiling: plenty of correctly-named rips
-        won't have a resolution tag at all, so a FALSE result here just
-        means "unverified," not "wrong."
+        4K), 'Basic' when it contains just the year, or 'None' when
+        neither is present. Title text alone is what short titles like
+        "M" or "Pi" abuse to produce false positives, so the year is the
+        real gate - resolution on top is extra reassurance, not a
+        requirement, which is why it earns its own, slightly softer tier
+        rather than being required outright.
     #>
     param(
         [Parameter(Mandatory)][string]$FilePath,
         [string]$Year
     )
 
-    if (-not $Year) {
-        return $false
+    if (-not $Year -or $FilePath -notmatch [regex]::Escape($Year)) {
+        return 'None'
     }
 
-    $hasYear       = $FilePath -match [regex]::Escape($Year)
-    $hasResolution = $FilePath -match '(?i)\b(480p|720p|1080p|2160p|4k)\b'
-    return $hasYear -and $hasResolution
+    if ($FilePath -match '(?i)\b(480p|720p|1080p|2160p|4k)\b') {
+        return 'Strong'
+    }
+
+    return 'Basic'
 }
 
 # ---------------------------------------------------------------------------
@@ -91,9 +92,6 @@ $OutputFile = switch ($ShowMode) {
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-# Out-File overwrites by default (no -Append below), so this isn't
-# strictly required - it's just insurance against stale content if a
-# previous run ever left the file in a weird state.
 if (Test-Path $OutputFile) {
     Remove-Item -Path $OutputFile
 }
@@ -107,7 +105,7 @@ if (-not (Test-Path $Config.MovieListJson)) {
     throw "Movie list JSON not found at $($Config.MovieListJson). Did the Python script run correctly?"
 }
 
-# Each entry is now {Title, Year} rather than a bare string, so the
+# Each entry is {Title, Year} rather than a bare string, so the
 # confidence check below has a year to work with.
 $movieEntries = Get-Content -Path $Config.MovieListJson -Raw | ConvertFrom-Json
 
@@ -120,24 +118,15 @@ $MoviesWithNoLocalAndRemoteResults  = 0
 # of opening/closing the output file on every single Out-File -Append call.
 $resultsBuffer = [System.Collections.Generic.List[string]]::new()
 
-# $movieEntries already came from the JSON we just parsed, so the total is
-# just its length - no need to hardcode a count or call back into Python.
 $totalMovies = @($movieEntries).Count
 $i = 0
 
 # Get-SearchFriendlyTitle and Format-ServerNameList live in
 # MovieSearchHelpers.ps1, dot-sourced above.
 
-# $remoteCheckRan is reused below to decide whether the summary's
-# friend's-server numbers actually mean anything for this run. Runs for
-# every mode, ResultsOnly included - even a movie found locally is worth
-# cross-referencing, since a local "match" can itself be a false
-# positive, and remote availability is a useful data point either way.
 $remoteCheckRan = [bool]($Config.PlexAccountToken -and $Config.FriendServerNames -and $Config.FriendServerNames.Count -gt 0)
 
 if ($remoteCheckRan) {
-    # A hashtable: normalized title -> list of friend server names that
-    # have it, aggregated across every server in FriendServerNames.
     $remoteAvailability = Get-RemoteMovieAvailability -AccountToken $Config.PlexAccountToken `
         -ClientIdentifier $Config.PlexClientIdentifier `
         -FriendServerNames $Config.FriendServerNames `
@@ -154,9 +143,6 @@ else {
 foreach ($movieEntry in $movieEntries) {
     $i++
 
-    # Only redraw every 5 movies (or on the last one). Write-Progress on
-    # every single iteration is what was making the terminal feel like it
-    # was hanging - the script was running fine, the redraw was just slow.
     if ($i % 5 -eq 0 -or $i -eq $totalMovies) {
         Write-Progress -Activity "Creating Results List" `
             -Status "Processed $i of $totalMovies movies" `
@@ -166,15 +152,9 @@ foreach ($movieEntry in $movieEntries) {
     $movie = $movieEntry.Title
     $year  = $movieEntry.Year
 
-    # -MatchWholeWord requires each search term to match a standalone
-    # word/token in the filename, not just appear as a substring - this
-    # is what keeps "M" from matching "Madness.mkv".
     $searchResults = Search-Everything -Global -Filter $movie -Extension $Config.Extensions -MatchWholeWord
     $matchedTitle  = $movie
 
-    # Exact title came up empty - retry once with punctuation stripped
-    # out, since that's usually why a file that's clearly there doesn't
-    # match.
     if ($null -eq $searchResults) {
         $cleanTitle = Get-SearchFriendlyTitle -Title $movie
         if ($cleanTitle -and $cleanTitle -ne $movie) {
@@ -185,13 +165,6 @@ foreach ($movieEntry in $movieEntries) {
         }
     }
 
-    # Still nothing, and the title itself contains an alternate-title
-    # separator (e.g. "La battaglia di Algeri / The Battle of Algiers") -
-    # try each side on its own, since your local file is likely named
-    # after only one of them. This only helps when Letterboxd's own title
-    # text actually contains both forms; a single foreign-language title
-    # with no English text in it at all isn't something string matching
-    # can solve.
     if ($null -eq $searchResults -and $movie -match ' / ') {
         foreach ($titlePart in ($movie -split ' / ')) {
             $titlePart = $titlePart.Trim()
@@ -209,9 +182,6 @@ foreach ($movieEntry in $movieEntries) {
 
     $foundLocally = $null -ne $searchResults
 
-    # Computed fresh every single iteration, regardless of $foundLocally,
-    # so a movie that WAS found locally can never inherit a stale value
-    # left over from a different, earlier movie's iteration.
     $normalizedTitle = Get-SearchFriendlyTitle -Title $movie
     $serverNames     = $remoteAvailability[$normalizedTitle]
     $onFriendsServer = $serverNames -and $serverNames.Count -gt 0
@@ -229,60 +199,101 @@ foreach ($movieEntry in $movieEntries) {
         }
     }
 
-    # Each mode below is an independent check against the same two
-    # booleans - none of them live nested inside another mode's branch,
-    # so every mode always sees the exact same, always-current state.
     if ($foundLocally -and $ShowMode -in 'ResultsOnly', 'Both') {
-        $resultsToShow     = @($searchResults | Select-Object -Last $Config.MaxResultsShown)
-        $confidentResults  = @($resultsToShow | Where-Object { Test-ConfidentMatch -FilePath $_ -Year $year })
-        $resultCount       = @($searchResults).Count
-        $resultWord        = if ($resultCount -eq 1) { 'result' } else { 'results' }
+        $resultsToShow = @($searchResults | Select-Object -Last $Config.MaxResultsShown)
 
-        $line = "'$movie' returned $resultCount $resultWord."
-        if ($confidentResults.Count -gt 0) {
-            $line += " (confident match - title, year & resolution all present)"
+        $confidenceByResult = @{}
+        foreach ($result in $resultsToShow) {
+            $confidenceByResult[$result] = Get-MatchConfidence -FilePath $result -Year $year
         }
-        else {
-            $line += " (low confidence - verify manually)"
+        $bestConfidence = 'None'
+        if ('Strong' -in $confidenceByResult.Values) { $bestConfidence = 'Strong' }
+        elseif ('Basic' -in $confidenceByResult.Values) { $bestConfidence = 'Basic' }
+
+        $resultCount = @($searchResults).Count
+        $resultWord  = if ($resultCount -eq 1) { 'result' } else { 'results' }
+        $emoji = switch ($bestConfidence) {
+            'Strong' { '✅' }
+            'Basic'  { '🟡' }
+            default  { '⚠️' }
+        }
+
+        $resultsBuffer.Add("### $emoji '$movie' — $resultCount $resultWord")
+
+        switch ($bestConfidence) {
+            'Strong' { $resultsBuffer.Add('_Confident match — title, year & resolution all present_') }
+            'Basic'  { $resultsBuffer.Add('_Confident match — title and year are present_') }
+            default  { $resultsBuffer.Add('_Low confidence — verify manually_') }
         }
         if ($matchedTitle -ne $movie) {
-            $line += " (matched via cleaned title: '$matchedTitle')"
+            $resultsBuffer.Add(('_Matched via cleaned title: `{0}`_' -f $matchedTitle))
         }
         if ($onFriendsServer) {
-            $line += " (available on $(Format-ServerNameList -Names $serverNames) Plex server)"
+            $resultsBuffer.Add("_Also available on $(Format-ServerNameList -Names $serverNames) Plex server_")
         }
+        $resultsBuffer.Add('')
 
-        $resultsBuffer.Add($line)
-        $resultsBuffer.Add(('-' * 68))
         foreach ($result in $resultsToShow) {
-            if ($confidentResults -contains $result) {
-                $resultsBuffer.Add("  * $result")
+            if ($confidenceByResult[$result] -ne 'None') {
+                $resultsBuffer.Add(('- **`{0}`**' -f $result))
             }
             else {
-                $resultsBuffer.Add("  $result")
+                $resultsBuffer.Add(('- `{0}`' -f $result))
             }
         }
+        $resultsBuffer.Add('')
+        $resultsBuffer.Add('---')
         $resultsBuffer.Add('')
     }
 
     if (-not $foundLocally -and $ShowMode -in 'NoResultsOnly', 'Both') {
-        $line = "'$movie' did not return any results."
+        $resultsBuffer.Add("### ❌ '$movie'")
+        $resultsBuffer.Add('_Did not return any results._')
         if ($onFriendsServer) {
-            $line += " (available on $(Format-ServerNameList -Names $serverNames) Plex server)"
+            $resultsBuffer.Add("_Available on $(Format-ServerNameList -Names $serverNames) Plex server_")
         }
-        $resultsBuffer.Add($line)
+        $resultsBuffer.Add('')
+        $resultsBuffer.Add('---')
         $resultsBuffer.Add('')
     }
 
     if (-not $foundLocally -and -not $onFriendsServer -and $ShowMode -eq 'NoLocalAndRemoteResultsOnly') {
-        $resultsBuffer.Add("'$movie' was not found on your computer and is also not available on $(Format-ServerNameList -Names $Config.FriendServerNames -Conjunction 'or') Plex server.")
+        $resultsBuffer.Add("### ❌ '$movie'")
+        $resultsBuffer.Add("_Not found on your computer, and not available on $(Format-ServerNameList -Names $Config.FriendServerNames -Conjunction 'or') Plex server._")
+        $resultsBuffer.Add('')
+        $resultsBuffer.Add('---')
         $resultsBuffer.Add('')
     }
 }
 
 Write-Progress -Activity "Creating Results List" -Completed
 
-$resultsBuffer | Out-File -FilePath $OutputFile -Encoding utf8 -Width 200
+# ---------------------------------------------------------------------------
+# Header - written last, since it needs final totals, then placed first
+# ---------------------------------------------------------------------------
+$modeLabel = switch ($ShowMode) {
+    'ResultsOnly'                 { 'Movies With Results' }
+    'NoResultsOnly'               { 'Movies With No Results' }
+    'Both'                        { 'All Movies' }
+    'NoLocalAndRemoteResultsOnly' { 'Movies Not Found Anywhere' }
+}
+
+$header = [System.Collections.Generic.List[string]]::new()
+$header.Add("# Movie Search Results — $modeLabel")
+$header.Add('')
+$header.Add("_$MoviesWithResults of $totalMovies movies found locally._")
+if ($remoteCheckRan) {
+    $serverList = Format-ServerNameList -Names $Config.FriendServerNames
+    $header.Add("_Of the $MoviesWithNoResults not found locally, $MoviesOnlyOnFriendsServer are available on $serverList Plex server._")
+}
+$header.Add('')
+$header.Add('---')
+$header.Add('')
+
+$finalLines = [System.Collections.Generic.List[string]]::new()
+$finalLines.AddRange($header)
+$finalLines.AddRange($resultsBuffer)
+$finalLines | Out-File -FilePath $OutputFile -Encoding utf8
 
 # ---------------------------------------------------------------------------
 # Summary
