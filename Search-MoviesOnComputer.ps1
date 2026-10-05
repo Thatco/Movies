@@ -59,6 +59,33 @@ function Get-MatchConfidence {
     return 'Basic'
 }
 
+function Search-MovieEverything {
+    <#
+        Tries an Everything search for $Title with -MatchWholeWord first
+        (precise - keeps "M" from matching "Madness.mkv"), then retries
+        without it if that finds nothing. Covers filenames that join
+        title words with underscores or other non-space characters -
+        Everything's whole-word check treats "Vermilion_Souls.avi" as one
+        single token, which never equals "Vermilion" or "Souls" on their
+        own, so whole-word mode alone would always miss it.
+
+        Used for every search tier (exact title, cleaned title, and each
+        half of a slash-separated alternate title) rather than just the
+        first, so "strict, then loosen" stays consistent no matter how
+        many fallback layers end up stacked on top of each other.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string[]]$Extensions
+    )
+
+    $results = Search-Everything -Global -Filter $Title -Extension $Extensions -MatchWholeWord
+    if ($null -eq $results) {
+        $results = Search-Everything -Global -Filter $Title -Extension $Extensions
+    }
+    return $results
+}
+
 # ---------------------------------------------------------------------------
 # Ask which results to include, and which file that corresponds to
 # (skipped entirely if -ShowMode was passed on the command line)
@@ -152,13 +179,13 @@ foreach ($movieEntry in $movieEntries) {
     $movie = $movieEntry.Title
     $year  = $movieEntry.Year
 
-    $searchResults = Search-Everything -Global -Filter $movie -Extension $Config.Extensions -MatchWholeWord
+    $searchResults = Search-MovieEverything -Title $movie -Extensions $Config.Extensions
     $matchedTitle  = $movie
 
     if ($null -eq $searchResults) {
         $cleanTitle = Get-SearchFriendlyTitle -Title $movie
         if ($cleanTitle -and $cleanTitle -ne $movie) {
-            $searchResults = Search-Everything -Global -Filter $cleanTitle -Extension $Config.Extensions -MatchWholeWord
+            $searchResults = Search-MovieEverything -Title $cleanTitle -Extensions $Config.Extensions
             if ($searchResults) {
                 $matchedTitle = $cleanTitle
             }
@@ -172,7 +199,7 @@ foreach ($movieEntry in $movieEntries) {
             if (-not $cleanPart) {
                 continue
             }
-            $searchResults = Search-Everything -Global -Filter $cleanPart -Extension $Config.Extensions -MatchWholeWord
+            $searchResults = Search-MovieEverything -Title $cleanPart -Extensions $Config.Extensions
             if ($searchResults) {
                 $matchedTitle = $titlePart
                 break
