@@ -9,3 +9,6 @@ Config Text Files/
 Exported from Letterboxd/
 *.exe
 *.db
+*.md
+config.json
+remote_cache/
