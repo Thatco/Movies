@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS locations (
     size_bytes INTEGER,
     confidence TEXT CHECK (confidence IN ('low', 'basic', 'strong'))
 );
+CREATE TABLE IF NOT EXISTS remote_availability (
+    movie_id     INTEGER NOT NULL REFERENCES movies(id),
+    place_id     INTEGER NOT NULL REFERENCES places(id),
+    remote_title TEXT NOT NULL,
+    remote_year  INTEGER,
+    PRIMARY KEY (movie_id, place_id)
+);
 """
 
 def main():

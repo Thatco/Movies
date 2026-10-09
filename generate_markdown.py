@@ -2,13 +2,13 @@
 generate_markdown.py
 
 Builds the Markdown report from movies.db instead of from a live search.
-This is the "does the foundation work?" step: the report looks like the
-PowerShell script's output, but every line comes from database queries.
+Every line comes from database queries.
 
 Usage (from the MovieSearch folder):
     python generate_markdown.py            # all movies (default)
     python generate_markdown.py results    # only movies with files
-    python generate_markdown.py noresults  # only movies with no files
+    python generate_markdown.py noresults  # only movies with no local files
+    python generate_markdown.py nowhere    # not on your drives or any friend's server
 
 Each movie's heading uses its BEST confidence level. With
 HIDE_LOWER_CONFIDENCE on, only the files at that best level are listed, so
@@ -16,8 +16,11 @@ a movie with a strong match no longer drags along hundreds of low-confidence
 false positives. Movies whose best match is low still list their low files,
 flagged for manual checking.
 
-Not shown yet (this information isn't in the database): the "Also available
-on Plex" line and the "matched via cleaned title" note.
+Remote (Plex) availability comes from the remote_availability table, filled
+by remote_scanner.py. If that has never been run, the remote lines are
+simply left out.
+
+Not shown yet: the "matched via cleaned title" note (not stored).
 """
 
 import argparse
@@ -50,6 +53,7 @@ MODES = {
     "both": ("AllMovies_fromdb.md", "All Movies"),
     "results": ("MoviesWithResults_fromdb.md", "Movies With Results"),
     "noresults": ("MoviesWithNoResults_fromdb.md", "Movies With No Results"),
+    "nowhere": ("NotFoundAnywhere_fromdb.md", "Movies Not Found Anywhere"),
 }
 
 
@@ -61,6 +65,24 @@ def format_size(size_bytes):
     if gb >= 1:
         return f"{gb:.1f} GB"
     return f"{size_bytes / 1024**2:.0f} MB"
+
+
+def format_server_names(names, conjunction="and"):
+    """Join server names into a natural phrase with possessives.
+
+    ["A"]            -> "A's"
+    ["A", "B"]       -> "A's and B's"
+    ["A", "B", "C"]  -> "A's, B's, and C's"
+    Pass conjunction="or" for phrasing like "not on A's, B's, or C's server".
+    """
+    possessives = [f"{name}'s" for name in names]
+    if not possessives:
+        return ""
+    if len(possessives) == 1:
+        return possessives[0]
+    if len(possessives) == 2:
+        return f"{possessives[0]} {conjunction} {possessives[1]}"
+    return f"{', '.join(possessives[:-1])}, {conjunction} {possessives[-1]}"
 
 
 def build_report(conn, mode):
@@ -75,15 +97,34 @@ def build_report(conn, mode):
     ):
         files_by_movie[movie_id].append((path, size, confidence))
 
+    # Same idea for remote availability: movie id -> [server names].
+    servers_by_movie = defaultdict(list)
+    for movie_id, server_name in conn.execute(
+        """
+        SELECT r.movie_id, p.name FROM remote_availability r
+        JOIN places p ON p.id = r.place_id ORDER BY p.name
+        """
+    ):
+        servers_by_movie[movie_id].append(server_name)
+
+    # Every remote server the database knows about (for "not on A, B, or C").
+    remote_places = [
+        name for (name,) in conn.execute(
+            "SELECT name FROM places WHERE kind = 'remote' ORDER BY name"
+        )
+    ]
+
     body = []
     found_count = 0
+    only_remote_count = 0
 
     for movie_id, title, _year in movies:
         files = files_by_movie.get(movie_id, [])
+        servers = servers_by_movie.get(movie_id, [])
 
         if files:
             found_count += 1
-            if mode == "noresults":
+            if mode in ("noresults", "nowhere"):
                 continue
 
             # Best confidence = the highest-ranked level among its files.
@@ -94,8 +135,11 @@ def build_report(conn, mode):
             word = "result" if len(shown) == 1 else "results"
             body.append(f"### {EMOJI[best]} '{title}' — {len(shown)} {word}")
             body.append(DESCRIPTION[best])
+            if servers:
+                body.append(f"_Also available on {format_server_names(servers)} Plex server_")
             if hidden_count:
-                body.append(f"_({hidden_count} lower-confidence matches hidden)_")
+                noun = "match" if hidden_count == 1 else "matches"
+                body.append(f"_({hidden_count} lower-confidence {noun} hidden)_")
             body.append("")
 
             for path, size, confidence in shown[:MAX_RESULTS_SHOWN]:
@@ -105,25 +149,41 @@ def build_report(conn, mode):
             if len(shown) > MAX_RESULTS_SHOWN:
                 body.append(f"- _...and {len(shown) - MAX_RESULTS_SHOWN} more_")
         else:
+            if servers:
+                only_remote_count += 1
             if mode == "results":
                 continue
+            if mode == "nowhere" and servers:
+                continue  # it IS available somewhere, so not for this report
+
             body.append(f"### ❌ '{title}'")
-            body.append("_Did not return any results._")
+            if mode == "nowhere":
+                body.append(
+                    "_Not found on your computer, and not available on "
+                    f"{format_server_names(remote_places, 'or')} Plex server._"
+                )
+            else:
+                body.append("_Did not return any results._")
+                if servers:
+                    body.append(f"_Available on {format_server_names(servers)} Plex server_")
 
         body.append("")
         body.append("---")
         body.append("")
 
     # The header needs the final counts, so it's built last and put first.
-    label = MODES[mode][1]
     header = [
-        f"# Movie Search Results — {label}",
+        f"# Movie Search Results — {MODES[mode][1]}",
         "",
         f"_{found_count} of {len(movies)} movies found locally._",
-        "",
-        "---",
-        "",
     ]
+    if remote_places:
+        not_local = len(movies) - found_count
+        header.append(
+            f"_Of the {not_local} not found locally, {only_remote_count} are available "
+            f"on {format_server_names(remote_places)} Plex server._"
+        )
+    header += ["", "---", ""]
     return header + body
 
 
@@ -136,8 +196,12 @@ def main():
         sys.exit("movies.db not found. Run database.py and scanner.py first.")
 
     conn = sqlite3.connect(DB_PATH)
-    lines = build_report(conn, args.mode)
-    conn.close()
+    try:
+        lines = build_report(conn, args.mode)
+    except sqlite3.OperationalError as error:
+        sys.exit(f"Database problem: {error}. Did you add remote_availability to database.py and re-run it?")
+    finally:
+        conn.close()
 
     output_path = HERE / MODES[args.mode][0]
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
