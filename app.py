@@ -29,15 +29,24 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote_plus
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QAction,
+    QDesktopServices,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QKeySequence,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -46,6 +55,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QToolButton,
     QTreeWidget,
@@ -63,6 +73,14 @@ DB_PATH = Path(__file__).parent / "movies.db"
 REFRESH_DELAY_MS = 200
 
 CONFIDENCE_ICONS = {"strong": "✅", "basic": "🟡", "low": "⚠️"}
+
+# Zoom: the whole UI font is scaled between these limits, in these steps.
+ZOOM_STEP = 0.1
+ZOOM_MIN = 0.6
+ZOOM_MAX = 3.0
+
+# The search box text is this many times bigger than the normal UI text.
+SEARCH_FONT_SCALE = 1.5
 
 
 class CollapsibleSection(QWidget):
@@ -82,11 +100,18 @@ class CollapsibleSection(QWidget):
         # Header row: arrow + title on the left, All / None on the right.
         self.toggle_button = QToolButton()
         self.toggle_button.setText(title)
-        self.toggle_button.setCheckable(True)
-        self.toggle_button.setChecked(expanded)
+        self.expanded = expanded
         self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.toggle_button.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
-        self.toggle_button.toggled.connect(self._on_toggled)
+        # Flat and bold. Deliberately NOT done with a stylesheet: any
+        # stylesheet stops the widget following zoom changes, whereas
+        # setBold() changes only the weight and still inherits the size.
+        # (The button isn't "checkable" either, since a checked button is
+        # drawn as pressed-in; we track expanded/collapsed ourselves.)
+        self.toggle_button.setAutoRaise(True)
+        header_font = self.toggle_button.font()
+        header_font.setBold(True)
+        self.toggle_button.setFont(header_font)
+        self.toggle_button.clicked.connect(self._on_clicked)
 
         header = QHBoxLayout()
         header.addWidget(self.toggle_button)
@@ -114,12 +139,13 @@ class CollapsibleSection(QWidget):
         self.checkboxes = []  # list of (QCheckBox, data) pairs
         self._update_arrow()
 
-    def _on_toggled(self, expanded):
-        self.content.setVisible(expanded)
+    def _on_clicked(self):
+        self.expanded = not self.expanded
+        self.content.setVisible(self.expanded)
         self._update_arrow()
 
     def _update_arrow(self):
-        arrow = Qt.DownArrow if self.toggle_button.isChecked() else Qt.RightArrow
+        arrow = Qt.DownArrow if self.expanded else Qt.RightArrow
         self.toggle_button.setArrowType(arrow)
 
     def add_checkbox(self, text, checked, data=None):
@@ -174,8 +200,19 @@ class MainWindow(QMainWindow):
         self.refresh_timer.setInterval(REFRESH_DELAY_MS)
         self.refresh_timer.timeout.connect(self.refresh)
 
+        # 100% zoom = whatever font the system gave the application.
+        self.base_font = QApplication.font()
+        if self.base_font.pointSizeF() <= 0:
+            self.base_font.setPointSizeF(9.0)
+        self.zoom_factor = 1.0
+
         self._build_ui()
-        self.refresh()
+        self._build_view_menu()
+        # An application-wide event filter lets Ctrl + mouse wheel zoom
+        # no matter which widget the mouse is over (see eventFilter below).
+        QApplication.instance().installEventFilter(self)
+
+        self.set_zoom(1.0)  # also applies the search box font and refreshes
 
     # ------------------------------------------------------------------
     # Building the window
@@ -186,6 +223,11 @@ class MainWindow(QMainWindow):
         self.search_box.setPlaceholderText("Search movies...")
         self.search_box.setClearButtonEnabled(True)
         self.search_box.textChanged.connect(self.schedule_refresh)
+        # Wide but capped, so it stays tidy on a fullscreen window. The
+        # font size and height are set in set_zoom() so they follow zoom.
+        self.search_box.setMinimumWidth(450)
+        self.search_box.setMaximumWidth(950)
+        self.search_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.sort_box = QComboBox()
         self.sort_box.addItems(queries.SORT_OPTIONS.keys())
@@ -194,22 +236,37 @@ class MainWindow(QMainWindow):
         expand_button = QPushButton("Expand all")
         collapse_button = QPushButton("Collapse all")
 
+        # Equal stretches on both sides keep the search box centered.
         top_row = QHBoxLayout()
-        top_row.addWidget(self.search_box, stretch=1)
-        top_row.addWidget(QLabel("Sort by:"))
-        top_row.addWidget(self.sort_box)
-        top_row.addWidget(expand_button)
-        top_row.addWidget(collapse_button)
+        top_row.addStretch(1)
+        top_row.addWidget(self.search_box, stretch=4)
+        top_row.addStretch(1)
+
+        # Sort and expand/collapse sit just above the results list.
+        controls_row = QHBoxLayout()
+        controls_row.addStretch()
+        controls_row.addWidget(QLabel("Sort by:"))
+        controls_row.addWidget(self.sort_box)
+        controls_row.addWidget(expand_button)
+        controls_row.addWidget(collapse_button)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addLayout(controls_row)
 
         # --- Results tree (right side) ---
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Movie / File", "Year", "Match", "Size", "Place"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
-        self.tree.setColumnWidth(0, 560)
-        self.tree.setColumnWidth(1, 55)
-        self.tree.setColumnWidth(2, 90)
-        self.tree.setColumnWidth(3, 75)
+        # The first column takes the leftover space; the others fit their
+        # contents, so nothing is cut off at any zoom level.
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in (1, 2, 3, 4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
         expand_button.clicked.connect(self.tree.expandAll)
@@ -225,11 +282,11 @@ class MainWindow(QMainWindow):
         self._build_filter_sections()
         self.filter_layout.addStretch()
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(filter_area)
-        scroll.setMinimumWidth(250)
-        sidebar_layout.addWidget(scroll, stretch=1)
+        self.filter_scroll = QScrollArea()
+        self.filter_scroll.setWidgetResizable(True)
+        self.filter_scroll.setWidget(filter_area)
+        self.filter_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sidebar_layout.addWidget(self.filter_scroll, stretch=1)
 
         info_box = QGroupBox("Info")
         info_layout = QVBoxLayout(info_box)
@@ -241,8 +298,9 @@ class MainWindow(QMainWindow):
 
         # --- Put it all together ---
         splitter = QSplitter(Qt.Horizontal)
+        right_layout.addWidget(self.tree)
         splitter.addWidget(sidebar)
-        splitter.addWidget(self.tree)
+        splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([280, 900])
@@ -339,12 +397,14 @@ class MainWindow(QMainWindow):
         # Turning off repainting while we add thousands of rows is much faster.
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
-        bold = QFont()
+        bold = QFont(self.tree.font())
         bold.setBold(True)
 
         for movie in results:
             top = QTreeWidgetItem([movie.title, str(movie.year or ""), "", "", ""])
             top.setFont(0, bold)
+            # Stash (title, year) on the row for the right-click menu.
+            top.setData(0, Qt.UserRole + 1, (movie.title, movie.year))
             self.tree.addTopLevelItem(top)
 
             if not movie.files and not movie.servers:
@@ -404,22 +464,113 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _show_context_menu(self, position):
         item = self.tree.itemAt(position)
-        path = item.data(0, Qt.UserRole) if item else None
-        if not path:
-            return  # movie rows and Plex rows have no file to act on
+        if item is None:
+            return
+        file_path = item.data(0, Qt.UserRole)       # set on file rows
+        movie = item.data(0, Qt.UserRole + 1)       # (title, year) on movie rows
 
         menu = QMenu(self)
-        reveal_action = menu.addAction("Open containing folder")
-        copy_action = menu.addAction("Copy path")
-        open_action = menu.addAction("Open file")
-        chosen = menu.exec(self.tree.viewport().mapToGlobal(position))
+        if movie:
+            title, year = movie
+            copy_title = menu.addAction("Copy title")
+            duckduckgo = menu.addAction("Search DuckDuckGo")
+            letterboxd = menu.addAction("Find on Letterboxd")
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(position))
+            if chosen == copy_title:
+                QGuiApplication.clipboard().setText(title)
+            elif chosen == duckduckgo:
+                QDesktopServices.openUrl(QUrl(duckduckgo_url(title, year)))
+            elif chosen == letterboxd:
+                QDesktopServices.openUrl(QUrl(letterboxd_url(title, year)))
+        elif file_path:
+            reveal_action = menu.addAction("Open containing folder")
+            copy_action = menu.addAction("Copy path")
+            open_action = menu.addAction("Open file")
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(position))
+            if chosen == reveal_action:
+                reveal_in_file_manager(file_path)
+            elif chosen == copy_action:
+                QGuiApplication.clipboard().setText(file_path)
+            elif chosen == open_action:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
+        # Plex rows have nothing to act on, so no menu appears for them.
 
-        if chosen == reveal_action:
-            reveal_in_file_manager(path)
-        elif chosen == copy_action:
-            QGuiApplication.clipboard().setText(path)
-        elif chosen == open_action:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+    # ------------------------------------------------------------------
+    # Zoom (View menu, Ctrl + / Ctrl - / Ctrl 0, Ctrl + mouse wheel)
+    # ------------------------------------------------------------------
+    def _build_view_menu(self):
+        view_menu = self.menuBar().addMenu("&View")
+
+        zoom_in = QAction("Zoom &In", self)
+        # Ctrl++ needs Shift on many keyboards, so Ctrl+= works as well.
+        zoom_in.setShortcuts([QKeySequence(QKeySequence.ZoomIn), QKeySequence("Ctrl+=")])
+        zoom_in.triggered.connect(self.zoom_in)
+
+        zoom_out = QAction("Zoom &Out", self)
+        zoom_out.setShortcut(QKeySequence(QKeySequence.ZoomOut))
+        zoom_out.triggered.connect(self.zoom_out)
+
+        zoom_reset = QAction("&Reset Zoom", self)
+        zoom_reset.setShortcut(QKeySequence("Ctrl+0"))
+        zoom_reset.triggered.connect(lambda: self.set_zoom(1.0))
+
+        for action in (zoom_in, zoom_out, zoom_reset):
+            view_menu.addAction(action)
+
+    def zoom_in(self):
+        self.set_zoom(self.zoom_factor + ZOOM_STEP)
+
+    def zoom_out(self):
+        self.set_zoom(self.zoom_factor - ZOOM_STEP)
+
+    def set_zoom(self, factor):
+        """Scale every font in the program to `factor` x the normal size."""
+        self.zoom_factor = round(max(ZOOM_MIN, min(ZOOM_MAX, factor)), 2)
+
+        font = QFont(self.base_font)
+        font.setPointSizeF(self.base_font.pointSizeF() * self.zoom_factor)
+        QApplication.setFont(font)  # updates every widget without its own font
+
+        # The search box has its own, larger font, so it's resized by hand.
+        search_font = QFont(font)
+        search_font.setPointSizeF(font.pointSizeF() * SEARCH_FONT_SCALE)
+        self.search_box.setFont(search_font)
+        self.search_box.setFixedHeight(int(QFontMetrics(search_font).height() * 1.8))
+
+        # Keep the sidebar wide enough for the larger text.
+        self.filter_scroll.setMinimumWidth(int(270 * self.zoom_factor))
+
+        # Tree rows set their own (bold) font, so rebuild them at the new size.
+        self.refresh()
+
+    def eventFilter(self, obj, event):
+        """Turn Ctrl + mouse wheel into zoom, wherever the mouse is."""
+        if event.type() == QEvent.Wheel and event.modifiers() & Qt.ControlModifier:
+            if event.angleDelta().y() > 0:
+                self.zoom_in()
+            elif event.angleDelta().y() < 0:
+                self.zoom_out()
+            return True  # we handled it; don't also scroll the list
+        return super().eventFilter(obj, event)
+
+
+def duckduckgo_url(title, year):
+    """A plain DuckDuckGo search for the movie."""
+    query = f"{title} {year or ''} film".strip()
+    return f"https://duckduckgo.com/?q={quote_plus(query)}"
+
+
+def letterboxd_url(title, year):
+    """Try to land directly on the movie's Letterboxd page.
+
+    Letterboxd's own search page is awkward, so this uses DuckDuckGo's
+    "!ducky" shortcut, which jumps straight to the first search result,
+    restricted to Letterboxd film pages. It's a best effort: an unusual
+    title can land on the wrong film. (Storing each movie's Letterboxd
+    link from your export would make this exact; that's a later upgrade.)
+    """
+    query = f'!ducky site:letterboxd.com/film "{title}" {year or ""}'.strip()
+    return f"https://duckduckgo.com/?q={quote_plus(query)}"
 
 
 def reveal_in_file_manager(path):
