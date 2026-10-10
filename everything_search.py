@@ -138,16 +138,15 @@ def find_movie_files(title):
 
     return results, matched_title
 
+# Years either side of the Letterboxd year that still count as a year match.
+# Set to 0 for exact-year matching only.
+YEAR_TOLERANCE = 1
 
 def match_confidence(path, year):
-    """Rate one file path: 'strong', 'basic', or 'low'.
-
-    strong : the path contains the release year AND a resolution tag.
-    basic  : the path contains the year only.
-    low    : no year found (title alone is how short titles like "M" or
-             "Pi" produce false positives, so the year is the real gate).
-    """
-    if not year or str(year) not in path:
+    if not year:
+        return "low"
+    acceptable_years = range(year - YEAR_TOLERANCE, year + YEAR_TOLERANCE + 1)
+    if not any(str(y) in path for y in acceptable_years):
         return "low"
     if RESOLUTION_PATTERN.search(path):
         return "strong"
