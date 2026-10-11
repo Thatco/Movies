@@ -12,3 +12,4 @@ Exported from Letterboxd/
 *.md
 config.json
 remote_cache/
+ui_settings.json

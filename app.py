@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEvent, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QDesktopServices,
@@ -65,12 +65,18 @@ from PySide6.QtWidgets import (
 )
 
 import queries
+from settings import load_settings, save_settings
 
 DB_PATH = Path(__file__).parent / "movies.db"
 
 # Delay (milliseconds) after the last change before the list is refreshed,
 # so typing quickly in the search box doesn't re-run the query per letter.
 REFRESH_DELAY_MS = 200
+
+# Delay (milliseconds) after the last change before settings are written to
+# disk. Saving a moment after changes (not only on exit) means a crash or
+# power cut can't lose your settings.
+SAVE_DELAY_MS = 1000
 
 CONFIDENCE_ICONS = {"strong": "✅", "basic": "🟡", "low": "⚠️"}
 
@@ -136,7 +142,8 @@ class CollapsibleSection(QWidget):
         layout.addLayout(header)
         layout.addWidget(self.content)
 
-        self.checkboxes = []  # list of (QCheckBox, data) pairs
+        self.checkboxes = []   # list of (QCheckBox, data) pairs
+        self.box_by_key = {}   # stable name -> QCheckBox, used for saving
         self._update_arrow()
 
     def _on_clicked(self):
@@ -148,13 +155,18 @@ class CollapsibleSection(QWidget):
         arrow = Qt.DownArrow if self.expanded else Qt.RightArrow
         self.toggle_button.setArrowType(arrow)
 
-    def add_checkbox(self, text, checked, data=None):
-        """Add a checkbox carrying `data` (e.g. a place id) with it."""
+    def add_checkbox(self, text, checked, data=None, key=None):
+        """Add a checkbox carrying `data` (e.g. a place id) with it.
+
+        `key` is a stable name used for saving (a place's NAME, never its
+        id, because ids change when the database is rebuilt).
+        """
         box = QCheckBox(text)
         box.setChecked(checked)
         box.toggled.connect(self._on_box_toggled)
         self.content_layout.addWidget(box)
         self.checkboxes.append((box, data))
+        self.box_by_key[key if key is not None else text] = box
         self._update_title()
         return box
 
@@ -177,6 +189,27 @@ class CollapsibleSection(QWidget):
     def checked_data(self):
         """The `data` of every ticked checkbox."""
         return [data for box, data in self.checkboxes if box.isChecked()]
+
+    def get_state(self):
+        """Expanded/collapsed plus every checkbox, as a saveable dict."""
+        return {
+            "expanded": self.expanded,
+            "checked": {key: box.isChecked() for key, box in self.box_by_key.items()},
+        }
+
+    def apply_state(self, state):
+        """Restore a dict from get_state(). Boxes missing from the saved
+        data (a brand-new drive, say) keep their default."""
+        self.expanded = bool(state.get("expanded", self.expanded))
+        self.content.setVisible(self.expanded)
+        self._update_arrow()
+        for key, value in state.get("checked", {}).items():
+            box = self.box_by_key.get(key)
+            if box is not None:
+                box.blockSignals(True)   # don't trigger a refresh per box
+                box.setChecked(bool(value))
+                box.blockSignals(False)
+        self._update_title()
 
     def set_all(self, state):
         """Tick or untick every checkbox, refreshing only once at the end."""
@@ -206,13 +239,25 @@ class MainWindow(QMainWindow):
             self.base_font.setPointSizeF(9.0)
         self.zoom_factor = 1.0
 
+        # Settings are saved shortly after the last change (see SAVE_DELAY_MS).
+        # `_ready` stays False during startup so that restoring the saved
+        # state doesn't immediately trigger a pointless save.
+        self._ready = False
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(SAVE_DELAY_MS)
+        self.save_timer.timeout.connect(self.save_now)
+
         self._build_ui()
         self._build_view_menu()
         # An application-wide event filter lets Ctrl + mouse wheel zoom
         # no matter which widget the mouse is over (see eventFilter below).
         QApplication.instance().installEventFilter(self)
 
-        self.set_zoom(1.0)  # also applies the search box font and refreshes
+        self._apply_settings(load_settings())
+        self.set_zoom(self.zoom_factor)  # applies fonts at the restored zoom
+        self.refresh()                   # first fill of the results tree
+        self._ready = True
 
     # ------------------------------------------------------------------
     # Building the window
@@ -297,13 +342,14 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(info_box)
 
         # --- Put it all together ---
-        splitter = QSplitter(Qt.Horizontal)
+        self.splitter = splitter = QSplitter(Qt.Horizontal)
         right_layout.addWidget(self.tree)
         splitter.addWidget(sidebar)
         splitter.addWidget(right_panel)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([280, 900])
+        splitter.splitterMoved.connect(self.schedule_save)
 
         central = QWidget()
         central_layout = QVBoxLayout(central)
@@ -316,11 +362,12 @@ class MainWindow(QMainWindow):
         # Confidence (fixed choices). Defaults match your preference:
         # trusted matches on, noisy low matches and "not found" off.
         self.confidence_section = CollapsibleSection("Confidence", expanded=True)
-        self.confidence_section.add_checkbox("✅ Strong", True, "strong")
-        self.confidence_section.add_checkbox("🟡 Basic", True, "basic")
-        self.confidence_section.add_checkbox("⚠️ Low", False, "low")
-        self.confidence_section.add_checkbox("❌ Not found", False, "not_found")
+        self.confidence_section.add_checkbox("✅ Strong", True, "strong", key="strong")
+        self.confidence_section.add_checkbox("🟡 Basic", True, "basic", key="basic")
+        self.confidence_section.add_checkbox("⚠️ Low", False, "low", key="low")
+        self.confidence_section.add_checkbox("❌ Not found", False, "not_found", key="not_found")
         self.confidence_section.changed.connect(self.schedule_refresh)
+        self.confidence_section.toggle_button.clicked.connect(self.schedule_save)
         self.filter_layout.addWidget(self.confidence_section)
 
         # Places come from the data: one checkbox per drive, share or server.
@@ -337,8 +384,9 @@ class MainWindow(QMainWindow):
                 continue  # no such places in the database yet
             section = CollapsibleSection(title, expanded=expanded)
             for place in kind_places:
-                section.add_checkbox(place.name, ticked, place.id)
+                section.add_checkbox(place.name, ticked, place.id, key=place.name)
             section.changed.connect(self.schedule_refresh)
+            section.toggle_button.clicked.connect(self.schedule_save)
             self.filter_layout.addWidget(section)
             self.place_sections[kind] = section
 
@@ -356,6 +404,7 @@ class MainWindow(QMainWindow):
         button_row = QHBoxLayout()
         button_row.addWidget(add_button)
         button_row.addWidget(remove_button)
+        self.exclude_section.toggle_button.clicked.connect(self.schedule_save)
         self.exclude_section.add_widget(self.exclude_list)
         self.exclude_section.content_layout.addLayout(button_row)
         self.filter_layout.addWidget(self.exclude_section)
@@ -366,6 +415,71 @@ class MainWindow(QMainWindow):
     def schedule_refresh(self, *_):
         """(Re)start the short timer; the refresh happens when it fires."""
         self.refresh_timer.start()
+        self.schedule_save()
+
+    # ------------------------------------------------------------------
+    # Saved settings
+    # ------------------------------------------------------------------
+    def schedule_save(self, *_):
+        """(Re)start the save timer; the file is written when it fires."""
+        if self._ready:
+            self.save_timer.start()
+
+    def _collect_settings(self):
+        """Gather everything worth remembering from the widgets."""
+        sections = {"confidence": self.confidence_section.get_state(),
+                    "exclude": self.exclude_section.get_state()}
+        for kind, section in self.place_sections.items():
+            sections[kind] = section.get_state()
+        return {
+            "zoom": self.zoom_factor,
+            # Window position/size/maximized, packed as text for the JSON file.
+            "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            "splitter": self.splitter.sizes(),
+            "sort": self.sort_box.currentText(),
+            "excluded_folders": self._excluded_folders(),
+            "sections": sections,
+        }
+
+    def save_now(self):
+        save_settings(self._collect_settings())
+
+    def _apply_settings(self, saved):
+        """Put saved values back into the widgets (anything missing or
+        invalid is simply skipped, leaving the default in place)."""
+        zoom = saved.get("zoom")
+        if isinstance(zoom, (int, float)):
+            self.zoom_factor = max(ZOOM_MIN, min(ZOOM_MAX, float(zoom)))
+
+        geometry = saved.get("geometry")
+        if isinstance(geometry, str):
+            self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+
+        sizes = saved.get("splitter")
+        if isinstance(sizes, list) and len(sizes) == 2 and all(isinstance(n, int) for n in sizes):
+            self.splitter.setSizes(sizes)
+
+        sort_name = saved.get("sort")
+        if sort_name in queries.SORT_OPTIONS:
+            self.sort_box.blockSignals(True)
+            self.sort_box.setCurrentText(sort_name)
+            self.sort_box.blockSignals(False)
+
+        for folder in saved.get("excluded_folders", []):
+            if isinstance(folder, str):
+                self.exclude_list.addItem(folder)
+
+        sections = saved.get("sections", {})
+        all_sections = {"confidence": self.confidence_section,
+                        "exclude": self.exclude_section, **self.place_sections}
+        for name, section in all_sections.items():
+            if isinstance(sections.get(name), dict):
+                section.apply_state(sections[name])
+
+    def closeEvent(self, event):
+        """Save one last time as the window closes."""
+        self.save_now()
+        super().closeEvent(event)
 
     def _checked_place_ids(self, kinds):
         ids = []
@@ -540,8 +654,15 @@ class MainWindow(QMainWindow):
         # Keep the sidebar wide enough for the larger text.
         self.filter_scroll.setMinimumWidth(int(270 * self.zoom_factor))
 
-        # Tree rows set their own (bold) font, so rebuild them at the new size.
-        self.refresh()
+        # Movie rows have their own (bold) font, so resize it by hand. The
+        # tree itself is NOT rebuilt, so your expanded/collapsed rows and
+        # scroll position stay exactly as they were.
+        bold = QFont(self.tree.font())
+        bold.setBold(True)
+        for index in range(self.tree.topLevelItemCount()):
+            self.tree.topLevelItem(index).setFont(0, bold)
+
+        self.schedule_save()
 
     def eventFilter(self, obj, event):
         """Turn Ctrl + mouse wheel into zoom, wherever the mouse is."""
