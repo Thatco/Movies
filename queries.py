@@ -18,6 +18,7 @@ How a movie ends up in the results (this is the heart of the filters):
 import re
 import sqlite3
 import unicodedata
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 # Display order of place kinds in the sidebar.
@@ -40,12 +41,26 @@ class FileEntry:
 
 
 @dataclass
+class LogEntry:
+    """One dated log of a film (a diary entry, or a rating date)."""
+    logged_date: str | None
+    watched_date: str | None
+    rating: float | None
+    rewatch: bool
+    source: str | None  # 'diary' or 'rating'
+
+
+@dataclass
 class MovieEntry:
     movie_id: int
     title: str
     year: int | None
     files: list = field(default_factory=list)    # visible FileEntry objects
     servers: list = field(default_factory=list)  # visible Plex server names
+    letterboxd_url: str | None = None
+    logs: list = field(default_factory=list)     # LogEntry objects, oldest first
+    first_logged: str | None = None              # earliest log date
+    last_logged: str | None = None               # latest log date
 
 
 @dataclass
@@ -65,7 +80,37 @@ SORT_OPTIONS = {
     "Title (Z-A)": (lambda m: m.title.casefold(), True),
     "Year (newest first)": (lambda m: (m.year is None, -(m.year or 0), m.title.casefold()), False),
     "Year (oldest first)": (lambda m: (m.year is None, m.year or 0, m.title.casefold()), False),
+    # Dates are ISO text (YYYY-MM-DD), which sorts correctly as plain text.
+    # Newest first uses each film's LATEST log; oldest first uses its EARLIEST.
+    # Films with no date at all always sort last in both directions.
+    "Date logged (newest first)": (lambda m: m.last_logged or "", True),
+    "Date logged (oldest first)": (lambda m: (m.first_logged is None, m.first_logged or ""), False),
 }
+
+
+def displayed_date(movie, sort_name):
+    """The date shown in the 'Logged' column: it matches the sort, so an
+    oldest-first list shows each film's first log, otherwise its latest."""
+    return movie.first_logged if sort_name == "Date logged (oldest first)" else movie.last_logged
+
+
+def describe_logs(movie):
+    """Plain-text summary of a film's logs, used as the row tooltip."""
+    lines = []
+    if movie.logs:
+        noun = "time" if len(movie.logs) == 1 else "times"
+        lines.append(f"Logged {len(movie.logs)} {noun}:")
+        for log in movie.logs:
+            date = log.logged_date or "no date"
+            parts = [f"rated {date}" if log.source == "rating" else date]
+            if log.watched_date and log.watched_date != log.logged_date:
+                parts.append(f"watched {log.watched_date}")
+            if log.rating is not None:
+                parts.append(f"\u2605{log.rating:g}")
+            if log.rewatch:
+                parts.append("rewatch")
+            lines.append("  " + " \u00b7 ".join(parts))
+    return "\n".join(lines)
 
 
 def format_size(size_bytes):
@@ -127,6 +172,34 @@ def _table_exists(conn, name):
     return row is not None
 
 
+def _load_movie_rows(conn):
+    """(id, title, year, letterboxd_url, watchlist_added) for every film.
+
+    Falls back to the older, smaller layout if database.py hasn't been
+    re-run yet, so the app still opens (just without the newer fields).
+    """
+    try:
+        return conn.execute(
+            "SELECT id, title, year, letterboxd_url, watchlist_added FROM movies"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return [(i, t, y, None, None) for i, t, y in conn.execute("SELECT id, title, year FROM movies")]
+
+
+def _load_logs(conn):
+    """All dated logs grouped by film id, each film's logs oldest first."""
+    logs_by_movie = defaultdict(list)
+    if not _table_exists(conn, "watch_logs"):
+        return logs_by_movie
+    rows = conn.execute(
+        "SELECT movie_id, logged_date, watched_date, rating, rewatch, source "
+        "FROM watch_logs ORDER BY logged_date, watched_date"
+    )
+    for movie_id, logged, watched, rating, rewatch, source in rows:
+        logs_by_movie[movie_id].append(LogEntry(logged, watched, rating, bool(rewatch), source))
+    return logs_by_movie
+
+
 def fetch_results(
     conn,
     search,
@@ -140,10 +213,19 @@ def fetch_results(
     """Return the list of MovieEntry objects matching the current filters."""
     # 1. Every movie that matches the search text.
     needle = _fold(search)
+    logs_by_movie = _load_logs(conn)
     movies = {}
-    for movie_id, title, year in conn.execute("SELECT id, title, year FROM movies"):
+    for movie_id, title, year, url, watchlist_added in _load_movie_rows(conn):
         if not needle or needle in _fold(title):
-            movies[movie_id] = MovieEntry(movie_id, title, year)
+            logs = logs_by_movie.get(movie_id, [])
+            dated = [log.logged_date for log in logs if log.logged_date]
+            # A film with no logs falls back to the date it joined the watchlist.
+            first = dated[0] if dated else watchlist_added
+            last = dated[-1] if dated else watchlist_added
+            movies[movie_id] = MovieEntry(
+                movie_id, title, year,
+                letterboxd_url=url, logs=logs, first_logged=first, last_logged=last,
+            )
 
     excluded = [_norm_path(folder) for folder in excluded_folders]
 
@@ -188,6 +270,10 @@ def fetch_results(
         m for m in movies.values()
         if m.files or m.servers or m.movie_id in not_found_ids
     ]
+    # Sort by title first, then by the chosen key. Python's sort is "stable"
+    # (ties keep their existing order), so films with the same date, or
+    # many logged on the same day, stay in alphabetical order.
+    results.sort(key=lambda m: m.title.casefold())
     key, reverse = SORT_OPTIONS[sort_name]
     results.sort(key=key, reverse=reverse)
     return results

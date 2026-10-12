@@ -20,9 +20,11 @@ from pathlib import Path
 HERE = Path(__file__).parent
 
 STEPS = [
+    ("Generate MovieList.json from Letterboxd export", "movie_list_export.py"),
     ("Loading the movie list", "database.py"),
     ("Scanning drives with Everything", "scanner.py"),
     ("Checking friends' Plex servers", "remote_scanner.py"),
+    ("Run the app to view the results", "app.py")
 ]
 
 

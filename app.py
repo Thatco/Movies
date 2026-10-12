@@ -302,7 +302,7 @@ class MainWindow(QMainWindow):
 
         # --- Results tree (right side) ---
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Movie / File", "Year", "Match", "Size", "Place"])
+        self.tree.setHeaderLabels(["Movie / File", "Year", "Match", "Size", "Place", "Logged"])
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
         # The first column takes the leftover space; the others fit their
@@ -310,7 +310,7 @@ class MainWindow(QMainWindow):
         header = self.tree.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in (1, 2, 3, 4):
+        for column in (1, 2, 3, 4, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
@@ -513,12 +513,19 @@ class MainWindow(QMainWindow):
         self.tree.clear()
         bold = QFont(self.tree.font())
         bold.setBold(True)
+        sort_name = self.sort_box.currentText()
 
         for movie in results:
-            top = QTreeWidgetItem([movie.title, str(movie.year or ""), "", "", ""])
+            logged = queries.displayed_date(movie, sort_name) or ""
+            top = QTreeWidgetItem([movie.title, str(movie.year or ""), "", "", "", logged])
             top.setFont(0, bold)
-            # Stash (title, year) on the row for the right-click menu.
-            top.setData(0, Qt.UserRole + 1, (movie.title, movie.year))
+            # Stash (title, year, Letterboxd link) for the right-click menu.
+            top.setData(0, Qt.UserRole + 1, (movie.title, movie.year, movie.letterboxd_url))
+            # Hovering a movie lists every dated log (rewatches included).
+            tooltip = queries.describe_logs(movie)
+            if tooltip:
+                top.setToolTip(0, tooltip)
+                top.setToolTip(5, tooltip)
             self.tree.addTopLevelItem(top)
 
             if not movie.files and not movie.servers:
@@ -585,7 +592,7 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         if movie:
-            title, year = movie
+            title, year, letterboxd_link = movie
             copy_title = menu.addAction("Copy title")
             duckduckgo = menu.addAction("Search DuckDuckGo")
             letterboxd = menu.addAction("Find on Letterboxd")
@@ -595,7 +602,9 @@ class MainWindow(QMainWindow):
             elif chosen == duckduckgo:
                 QDesktopServices.openUrl(QUrl(duckduckgo_url(title, year)))
             elif chosen == letterboxd:
-                QDesktopServices.openUrl(QUrl(letterboxd_url(title, year)))
+                # The exact film page when we have its Letterboxd link,
+                # otherwise the best-effort search.
+                QDesktopServices.openUrl(QUrl(letterboxd_link or letterboxd_url(title, year)))
         elif file_path:
             reveal_action = menu.addAction("Open containing folder")
             copy_action = menu.addAction("Copy path")
