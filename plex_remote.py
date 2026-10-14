@@ -56,8 +56,12 @@ def _load_library_defaults(path):
     return {}
 
 
-def _choose_library(server_name, libraries, defaults_path):
-    """Return the key of the movie library to use on this server."""
+def _choose_library(server_name, libraries, defaults_path, interactive=True):
+    """Return the key of the movie library to use on this server.
+
+    interactive=False (used by the app's background refresh, which has no
+    console to type into) raises instead of asking when a choice is needed.
+    """
     defaults = _load_library_defaults(defaults_path)
 
     # A saved choice wins, as long as that library still exists.
@@ -67,6 +71,12 @@ def _choose_library(server_name, libraries, defaults_path):
 
     if len(libraries) == 1:
         return libraries[0]["key"]
+
+    if not interactive:
+        raise RuntimeError(
+            f"'{server_name}' has several movie libraries and none is chosen yet. "
+            "Run `python plex_remote.py` once in a terminal to pick one."
+        )
 
     # Several movie libraries: ask once, then remember the answer.
     while True:
@@ -84,7 +94,7 @@ def _choose_library(server_name, libraries, defaults_path):
     return key
 
 
-def _fetch_live(server_name, config, cache_folder, peek=False):
+def _fetch_live(server_name, config, cache_folder, peek=False, interactive=True):
     """Ask the server directly for its movie list. Raises on any failure."""
     token = config["plex_account_token"]
     client_id = config["plex_client_identifier"]
@@ -120,7 +130,9 @@ def _fetch_live(server_name, config, cache_folder, peek=False):
                  if d.get("type") == "movie"]
     if not libraries:
         raise RuntimeError(f"No movie library was found on '{server_name}'.")
-    key = _choose_library(server_name, libraries, cache_folder / "library_defaults.json")
+    key = _choose_library(
+        server_name, libraries, cache_folder / "library_defaults.json", interactive
+    )
 
     # Step 4: download every movie in that library.
     listing = _get_json(f"{base_url}/library/sections/{key}/all", server_token, client_id)
@@ -134,27 +146,38 @@ def _fetch_live(server_name, config, cache_folder, peek=False):
     return [{"title": m["title"], "year": m.get("year")} for m in raw_movies]
 
 
-def get_remote_movies(config=None, peek=False):
-    """Return {server_name: [{"title", "year"}, ...]} for every friend server."""
+def get_remote_movies(config=None, peek=False, interactive=True, progress=None, log=print):
+    """Return {server_name: [{"title", "year"}, ...]} for every friend server.
+
+    interactive : may ask you (in the terminal) which library to use.
+    progress    optional function(done, total, message) for progress updates.
+    log         function that receives notes about problems (default: print).
+                The app passes its own so notes can be shown in a window.
+    """
     config = config or load_config()
     cache_folder = HERE / config["remote_cache_folder"]  # absolute paths also work
     cache_folder.mkdir(parents=True, exist_ok=True)
 
+    server_names = config["friend_server_names"]
     results = {}
-    for server_name in config["friend_server_names"]:
+    for number, server_name in enumerate(server_names, start=1):
+        if progress:
+            progress(number - 1, len(server_names), f"Checking {server_name}")
         cache_file = cache_folder / f"{server_name}.json"
         try:
-            movies = _fetch_live(server_name, config, cache_folder, peek=peek)
+            movies = _fetch_live(server_name, config, cache_folder, peek=peek, interactive=interactive)
             # Refresh the cache so a future outage has something recent.
             cache_file.write_text(json.dumps(movies, ensure_ascii=False), encoding="utf-8")
             print(f"Live-checked '{server_name}': {len(movies)} movies.")
         except Exception as error:
-            print(f"Live check of '{server_name}' failed ({error}) - trying the cached list.")
+            log(f"Live check of '{server_name}' failed ({error}) - trying the cached list.")
             if not cache_file.exists():
-                print(f"No cached list for '{server_name}' either - skipping it this run.")
+                log(f"No cached list for '{server_name}' either - skipping it this run.")
                 continue
             movies = json.loads(cache_file.read_text(encoding="utf-8"))
         results[server_name] = movies
+    if progress:
+        progress(len(server_names), len(server_names), "Matching movies")
     return results
 
 

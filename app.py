@@ -28,10 +28,22 @@ Requires:  python -m pip install PySide6
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from urllib.parse import quote_plus
 
-from PySide6.QtCore import QByteArray, QEvent, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QObject,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QAction,
     QDesktopServices,
@@ -53,10 +65,15 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMainWindow,
     QMenu,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QStyle,
+    QTabBar,
+    QToolBar,
     QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
@@ -65,6 +82,7 @@ from PySide6.QtWidgets import (
 )
 
 import queries
+import scanner
 from settings import load_settings, save_settings
 
 DB_PATH = Path(__file__).parent / "movies.db"
@@ -84,6 +102,14 @@ CONFIDENCE_ICONS = {"strong": "✅", "basic": "🟡", "low": "⚠️"}
 ZOOM_STEP = 0.1
 ZOOM_MIN = 0.6
 ZOOM_MAX = 3.0
+
+# "Rescan Drives" asks "are you sure?" only when the last scan took longer
+# than this many seconds (or has never been timed). A quick scan makes a
+# misclick harmless, so it just runs.
+CONFIRM_RESCAN_IF_SLOWER_THAN = 15
+
+# Size of the toolbar icons at 100% zoom, in pixels.
+TOOLBAR_ICON_SIZE = 28
 
 # The search box text is this many times bigger than the normal UI text.
 SEARCH_FONT_SCALE = 1.5
@@ -221,6 +247,34 @@ class CollapsibleSection(QWidget):
         self.changed.emit()
 
 
+class TaskWorker(QObject):
+    """Runs one long task on a background thread so the window stays usable.
+
+    The task is a function(progress, note, cancel_event) -> result:
+      progress(done, total, message)  report how far along it is
+      note(text)                      pass back a message for the user
+      cancel_event                    a threading.Event; set when Cancel is clicked
+    The signals below carry its updates back to the window safely.
+    """
+
+    progress = Signal(int, int, str)
+    note = Signal(str)
+    finished = Signal(object, object)  # (result, error): one of them is None
+
+    def __init__(self, task):
+        super().__init__()
+        self.task = task
+        self.cancel_event = threading.Event()
+
+    @Slot()
+    def run(self):
+        try:
+            result = self.task(self.progress.emit, self.note.emit, self.cancel_event)
+            self.finished.emit(result, None)
+        except Exception as error:  # reported in a message box, not a crash
+            self.finished.emit(None, error)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, conn):
         super().__init__()
@@ -243,12 +297,18 @@ class MainWindow(QMainWindow):
         # `_ready` stays False during startup so that restoring the saved
         # state doesn't immediately trigger a pointless save.
         self._ready = False
+        self._status_text = ""        # the normal status bar message
+        self._thread = None           # background task, if one is running
+        self._worker = None
+        self._task_notes = []
+        self.last_scan_seconds = None  # how long the last rescan took
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(SAVE_DELAY_MS)
         self.save_timer.timeout.connect(self.save_now)
 
         self._build_ui()
+        self._build_toolbar()
         self._build_view_menu()
         # An application-wide event filter lets Ctrl + mouse wheel zoom
         # no matter which widget the mouse is over (see eventFilter below).
@@ -288,7 +348,17 @@ class MainWindow(QMainWindow):
         top_row.addStretch(1)
 
         # Sort and expand/collapse sit just above the results list.
+        # Scope tabs (All / Watched / Watchlist) on the left of the same row.
+        self.scope_keys = list(queries.SCOPES)
+        self.scope_bar = QTabBar()
+        self.scope_bar.setDrawBase(False)
+        self.scope_bar.setExpanding(False)
+        for key in self.scope_keys:
+            self.scope_bar.addTab(queries.SCOPES[key])
+        self.scope_bar.currentChanged.connect(self.schedule_refresh)
+
         controls_row = QHBoxLayout()
+        controls_row.addWidget(self.scope_bar)
         controls_row.addStretch()
         controls_row.addWidget(QLabel("Sort by:"))
         controls_row.addWidget(self.sort_box)
@@ -437,6 +507,8 @@ class MainWindow(QMainWindow):
             "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
             "splitter": self.splitter.sizes(),
             "sort": self.sort_box.currentText(),
+            "scope": self.scope_key(),
+            "last_scan_seconds": self.last_scan_seconds,
             "excluded_folders": self._excluded_folders(),
             "sections": sections,
         }
@@ -465,6 +537,20 @@ class MainWindow(QMainWindow):
             self.sort_box.setCurrentText(sort_name)
             self.sort_box.blockSignals(False)
 
+        scope = saved.get("scope")
+        if scope in self.scope_keys:
+            self.scope_bar.blockSignals(True)
+            self.scope_bar.setCurrentIndex(self.scope_keys.index(scope))
+            self.scope_bar.blockSignals(False)
+
+        seconds = saved.get("last_scan_seconds")
+        if isinstance(seconds, (int, float)):
+            self.last_scan_seconds = float(seconds)
+
+        self._apply_filter_state(saved)
+
+    def _apply_filter_state(self, saved):
+        """Restore the sidebar's checkboxes, section states and exclusions."""
         for folder in saved.get("excluded_folders", []):
             if isinstance(folder, str):
                 self.exclude_list.addItem(folder)
@@ -476,8 +562,24 @@ class MainWindow(QMainWindow):
             if isinstance(sections.get(name), dict):
                 section.apply_state(sections[name])
 
+    def _rebuild_filter_sections(self):
+        """Rebuild the sidebar from the database (after a scan may have
+        added new drives or servers), keeping every choice you'd made."""
+        saved = self._collect_settings()
+        while self.filter_layout.count():
+            item = self.filter_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._build_filter_sections()
+        self.filter_layout.addStretch()
+        self._apply_filter_state(saved)
+
     def closeEvent(self, event):
-        """Save one last time as the window closes."""
+        """Stop any running task, then save one last time."""
+        if self._thread is not None:
+            self._worker.cancel_event.set()
+            self._thread.quit()
+            self._thread.wait(15000)  # give it a moment to wind down
         self.save_now()
         super().closeEvent(event)
 
@@ -503,6 +605,7 @@ class MainWindow(QMainWindow):
             include_not_found="not_found" in confidence_choices,
             excluded_folders=self._excluded_folders(),
             sort_name=self.sort_box.currentText(),
+            scope=self.scope_key(),
         )
         self._fill_tree(results)
         self._update_info(results)
@@ -514,6 +617,8 @@ class MainWindow(QMainWindow):
         bold = QFont(self.tree.font())
         bold.setBold(True)
         sort_name = self.sort_box.currentText()
+        # In the Watchlist scope the date column means "added to watchlist".
+        self.tree.headerItem().setText(5, "Added" if self.scope_key() == "watchlist" else "Logged")
 
         for movie in results:
             logged = queries.displayed_date(movie, sort_name) or ""
@@ -549,9 +654,11 @@ class MainWindow(QMainWindow):
 
     def _update_info(self, results):
         summary = queries.summarize(results)
-        total = queries.count_movies(self.conn)
+        scope = self.scope_key()
+        total = queries.count_movies(self.conn, scope)
+        scope_noun = {"all": "movies", "watched": "watched movies", "watchlist": "watchlist movies"}[scope]
         lines = [
-            f"<b>{summary.movies}</b> of {total} movies shown",
+            f"<b>{summary.movies}</b> of {total} {scope_noun} shown",
             f"<b>{summary.files}</b> {'file' if summary.files == 1 else 'files'} &middot; "
             f"<b>{queries.format_size(summary.total_bytes) or '0 MB'}</b>",
         ]
@@ -562,9 +669,171 @@ class MainWindow(QMainWindow):
                 noun = "file" if count == 1 else "files"
                 lines.append(f"{name} &mdash; {count} {noun}, {queries.format_size(size) or '0 MB'}")
         self.info_label.setText("<br>".join(lines))
-        self.statusBar().showMessage(
-            f"Showing {summary.movies} of {total} movies ({summary.files} files)"
+        self._set_status(f"Showing {summary.movies} of {total} {scope_noun} ({summary.files} files)")
+
+    def scope_key(self):
+        """'all', 'watched' or 'watchlist', from the tab that's selected."""
+        return self.scope_keys[self.scope_bar.currentIndex()]
+
+    def _set_status(self, text):
+        """The normal status bar message (what's being shown)."""
+        self._status_text = text
+        self.statusBar().showMessage(text)
+
+    def _flash_status(self, text, milliseconds=8000):
+        """Show a message for a few seconds, then go back to the normal one."""
+        self.statusBar().showMessage(text)
+        QTimer.singleShot(milliseconds, lambda: self.statusBar().showMessage(self._status_text))
+
+    # ------------------------------------------------------------------
+    # Toolbar and long-running tasks (rescan / refresh)
+    # ------------------------------------------------------------------
+    def _build_toolbar(self):
+        """Dolphin-style buttons: an icon with its name underneath."""
+        self.toolbar = QToolBar("Library")
+        self.toolbar.setMovable(False)
+        self.toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.toolbar.setIconSize(QSize(TOOLBAR_ICON_SIZE, TOOLBAR_ICON_SIZE))
+        style = self.style()  # built-in icons, so they match the platform
+
+        self.rescan_action = QAction(style.standardIcon(QStyle.SP_DriveHDIcon), "Rescan Drives", self)
+        self.rescan_action.setToolTip("Search your drives for every movie in the list")
+        self.rescan_action.triggered.connect(self.rescan_drives)
+
+        self.plex_action = QAction(style.standardIcon(QStyle.SP_DriveNetIcon), "Refresh Plex", self)
+        self.plex_action.setToolTip("Check your friends' Plex servers for your movies")
+        self.plex_action.triggered.connect(self.refresh_plex)
+
+        self.toolbar.addAction(self.rescan_action)
+        self.toolbar.addAction(self.plex_action)
+        self.addToolBar(Qt.TopToolBarArea, self.toolbar)
+
+        # The same actions in a menu, for keyboard and screen-reader users.
+        library_menu = self.menuBar().addMenu("&Library")
+        library_menu.addAction(self.rescan_action)
+        library_menu.addAction(self.plex_action)
+
+        # Progress widgets on the right of the status bar, hidden until needed.
+        self.task_label = QLabel()
+        self.task_progress = QProgressBar()
+        self.task_progress.setMaximumWidth(220)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self._cancel_task)
+        for widget in (self.task_label, self.task_progress, self.cancel_button):
+            self.statusBar().addPermanentWidget(widget)
+            widget.hide()
+
+    def _confirm_rescan(self):
+        """Ask 'are you sure?' unless the last scan was quick."""
+        last = self.last_scan_seconds
+        if last is not None and last < CONFIRM_RESCAN_IF_SLOWER_THAN:
+            return True
+        detail = (f"The last scan took about {last:.0f} seconds."
+                  if last else "This can take a minute or more.")
+        answer = QMessageBox.question(
+            self, "Rescan drives",
+            f"Rescan all drives for your movies?\n\n{detail}",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
         )
+        return answer == QMessageBox.Yes
+
+    def rescan_drives(self):
+        if self._thread is not None or not self._confirm_rescan():
+            return
+        self._start_task(
+            "Rescanning drives",
+            lambda progress, note, cancel: scanner.run_scan(progress=progress, cancel_event=cancel),
+            self._rescan_done,
+        )
+
+    def refresh_plex(self):
+        if self._thread is not None:
+            return
+
+        def task(progress, note, cancel):
+            # Imported here so the app still opens if the Plex pieces
+            # (the `requests` package, config.json) aren't set up yet.
+            import remote_scanner
+            return remote_scanner.run_remote_refresh(progress=progress, log=note, interactive=False)
+
+        self._start_task("Refreshing Plex", task, self._plex_done)
+
+    def _rescan_done(self, seconds):
+        self.last_scan_seconds = seconds
+        self._after_data_change()
+        self._flash_status(f"Rescan finished in {seconds:.0f} seconds.")
+
+    def _plex_done(self, summary):
+        self._after_data_change()
+        self._flash_status(
+            f"Plex refresh finished: {summary['matches']} matches on {summary['servers']} servers."
+        )
+
+    def _after_data_change(self):
+        """New data is in the database: rebuild the sidebar and the list."""
+        self._rebuild_filter_sections()
+        self.refresh()
+        self.schedule_save()
+
+    def _start_task(self, label, task, on_success):
+        """Run `task` on a background thread and show its progress."""
+        self._task_text = label
+        self._on_success = on_success
+        self._task_notes = []
+
+        self._thread = QThread(self)
+        self._worker = TaskWorker(task)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_task_progress)
+        self._worker.note.connect(self._on_task_note)
+        self._worker.finished.connect(self._on_task_finished)
+
+        self._set_task_ui(running=True)
+        self._thread.start()
+
+    def _set_task_ui(self, running):
+        self.rescan_action.setEnabled(not running)
+        self.plex_action.setEnabled(not running)
+        self.task_label.setText(f"{self._task_text}..." if running else "")
+        self.task_progress.setRange(0, 0)  # "busy" animation until real numbers arrive
+        for widget in (self.task_label, self.task_progress, self.cancel_button):
+            widget.setVisible(running)
+        self.cancel_button.setEnabled(running)
+
+    def _on_task_progress(self, done, total, message):
+        self.task_progress.setRange(0, max(total, 1))
+        self.task_progress.setValue(done)
+        self.task_label.setText(f"{message}: {done} of {total}")
+
+    def _on_task_note(self, text):
+        self._task_notes.append(text)
+
+    def _cancel_task(self):
+        if self._worker is not None:
+            self._worker.cancel_event.set()
+            self.cancel_button.setEnabled(False)
+            self.task_label.setText("Cancelling...")
+
+    def _on_task_finished(self, result, error):
+        # Let the thread finish cleanly before dropping our references.
+        self._thread.quit()
+        self._thread.wait()
+        self._thread.deleteLater()
+        self._worker.deleteLater()
+        self._thread = None
+        self._worker = None
+        self._set_task_ui(running=False)
+
+        if error is None:
+            self._on_success(result)
+        elif isinstance(error, scanner.ScanCancelled):
+            self._flash_status("Cancelled. Nothing was changed.")
+        else:
+            QMessageBox.warning(self, self._task_text, f"{self._task_text} failed:\n\n{error}")
+
+        if self._task_notes:
+            QMessageBox.information(self, self._task_text, "\n".join(self._task_notes))
 
     # ------------------------------------------------------------------
     # Folder exclusions
@@ -659,6 +928,10 @@ class MainWindow(QMainWindow):
         search_font.setPointSizeF(font.pointSizeF() * SEARCH_FONT_SCALE)
         self.search_box.setFont(search_font)
         self.search_box.setFixedHeight(int(QFontMetrics(search_font).height() * 1.8))
+
+        # Toolbar icons grow with the text.
+        icon_size = int(TOOLBAR_ICON_SIZE * self.zoom_factor)
+        self.toolbar.setIconSize(QSize(icon_size, icon_size))
 
         # Keep the sidebar wide enough for the larger text.
         self.filter_scroll.setMinimumWidth(int(270 * self.zoom_factor))

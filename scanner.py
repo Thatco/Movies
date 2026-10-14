@@ -9,18 +9,26 @@ Searches Everything for every movie in movies.db and records what it finds:
         D:\\Movies\\Heat.mkv           -> place "D:"            (local)
         \\\\NAS\\Share\\Heat.mkv         -> place "\\\\NAS\\Share"   (network)
 
-Run order: database.py (creates and fills the movie list) first, then this.
+Used two ways:
+  * python scanner.py          from the command line (prints progress)
+  * run_scan(...)              called by the app's "Rescan Drives" button
+
 Requirements: Everything must be running, and ES_PATH in
 everything_search.py must point at es.exe.
 
-Every run is a FULL RESCAN: old locations are cleared and rebuilt, so files
-you have deleted or moved stop showing up. All changes are saved in one
-step at the very end, so if the scan fails midway the previous results
-stay untouched.
+How it works, in two phases:
+  1. SEARCH  - es.exe is run for every movie, several at once (see
+     SEARCH_WORKERS). Nothing is written to the database yet.
+  2. SAVE    - old locations are cleared and the new ones written in one
+     quick all-or-nothing step.
+So a failed or cancelled search leaves the previous results untouched, and
+the database is only locked for a moment, not for the whole scan.
 """
 
 import sqlite3
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PureWindowsPath
 
 from everything_search import find_movie_files, match_confidence
@@ -28,8 +36,17 @@ from everything_search import find_movie_files, match_confidence
 HERE = Path(__file__).parent
 DB_PATH = HERE / "movies.db"
 
-# Print a progress line every this-many movies.
+# How many es.exe searches run at the same time. Each search is a separate
+# little process, so running several at once is much faster than one by one.
+# If you ever see odd es.exe errors, set this to 1 to go back to one-by-one.
+SEARCH_WORKERS = 8
+
+# Print a progress line every this-many movies (command-line use only).
 PROGRESS_EVERY = 25
+
+
+class ScanCancelled(Exception):
+    """Raised when the user cancels a scan; nothing has been changed."""
 
 
 def place_for_path(path):
@@ -66,23 +83,39 @@ def get_place_id(conn, cache, name, kind):
     return cache[name]
 
 
-def scan(conn):
-    """Search for every movie and store the results (not yet committed)."""
-    movies = conn.execute("SELECT id, title, year FROM movies ORDER BY id").fetchall()
-    total = len(movies)
+def search_all(titles, progress, cancel_event):
+    """Phase 1: search Everything for every title (several at once).
+
+    Returns a list of file lists, in the same order as `titles`.
+    """
+    total = len(titles)
+    pool = ThreadPoolExecutor(max_workers=SEARCH_WORKERS)
+    try:
+        futures = [pool.submit(find_movie_files, title) for title in titles]
+        found = []
+        # Collect results in order. .result() re-raises any error a search
+        # hit (for example Everything not running), which stops the scan.
+        for number, future in enumerate(futures, start=1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ScanCancelled()
+            files, _matched_title = future.result()
+            found.append(files)
+            if progress:
+                progress(number, total, "Searching drives")
+        return found
+    finally:
+        # Drop any searches still queued if we're leaving early.
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def save_results(conn, movies, found):
+    """Phase 2: replace the stored locations with the new results."""
     place_cache = {}
-
-    # Start from a clean slate. Places are kept; they're just drives.
-    conn.execute("DELETE FROM locations")
-
-    for number, (movie_id, title, year) in enumerate(movies, start=1):
-        # find_movie_files returns (list of (path, size), matched_title).
-        files, _matched_title = find_movie_files(title)
-
+    conn.execute("DELETE FROM locations")  # places are kept; they're just drives
+    for (movie_id, _title, year), files in zip(movies, found):
         for path, size in files:
             place = place_for_path(path)
             if place is None:
-                print(f"  Skipping path with no drive: {path}")
                 continue
             place_id = get_place_id(conn, place_cache, *place)
             conn.execute(
@@ -91,8 +124,32 @@ def scan(conn):
                 (movie_id, place_id, path, size, match_confidence(path, year)),
             )
 
-        if number % PROGRESS_EVERY == 0 or number == total:
-            print(f"Scanned {number} of {total} movies...")
+
+def run_scan(db_path=DB_PATH, progress=None, cancel_event=None):
+    """Do a full rescan. Returns how many seconds it took.
+
+    progress     optional function(done, total, message) for progress updates
+    cancel_event optional threading.Event; set it to cancel (raises
+                 ScanCancelled, and the database is left untouched)
+    """
+    started = time.time()
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        movies = conn.execute("SELECT id, title, year FROM movies ORDER BY id").fetchall()
+        found = search_all([title for _, title, _ in movies], progress, cancel_event)
+
+        try:
+            save_results(conn, movies, found)
+            conn.commit()  # save everything in one step
+        except Exception:
+            conn.rollback()  # undo a partial save; old results stay intact
+            raise
+    finally:
+        conn.close()
+
+    return time.time() - started
 
 
 def print_summary(conn):
@@ -138,18 +195,17 @@ def main():
     if not DB_PATH.exists():
         sys.exit("movies.db not found. Run database.py first.")
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        scan(conn)
-        conn.commit()  # save everything in one step
-    except Exception:
-        conn.rollback()  # undo the partial scan; old results stay intact
-        conn.close()
-        raise
+    def print_progress(done, total, _message):
+        if done % PROGRESS_EVERY == 0 or done == total:
+            print(f"Scanned {done} of {total} movies...")
 
+    seconds = run_scan(progress=print_progress)
+
+    conn = sqlite3.connect(DB_PATH)
     print_summary(conn)
     conn.close()
+    print(f"\nScan took {seconds:.0f} seconds.")
 
 
-main()
+if __name__ == "__main__":
+    main()

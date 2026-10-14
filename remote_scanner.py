@@ -96,18 +96,23 @@ def print_summary(conn):
     print(f"Not found anywhere: {nowhere}")
 
 
-def main():
-    if not DB_PATH.exists():
-        sys.exit("movies.db not found. Run database.py and scanner.py first.")
+def run_remote_refresh(db_path=DB_PATH, progress=None, log=print, interactive=False):
+    """Fetch every server's list and store the matches. Returns a summary.
 
+    Raises RuntimeError if no server data (live or cached) is available.
+    The app calls this from its "Refresh Plex" button; main() below calls
+    it from the command line (with interactive=True).
+    """
     # Do the network part BEFORE touching the database, so a failure here
     # can't leave anything half-updated.
-    remote_movies = get_remote_movies()
+    remote_movies = get_remote_movies(
+        interactive=interactive, progress=progress, log=log
+    )
     if not remote_movies:
-        sys.exit("No remote server data available (live or cached). Nothing updated.")
+        raise RuntimeError("No remote server data available (live or cached). Nothing updated.")
     index = build_index(remote_movies)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         # One 'remote' place per server (INSERT OR IGNORE = safe to repeat).
@@ -138,13 +143,28 @@ def main():
                         (movie_id, place_ids[server_name], remote_title, remote_year),
                     )
         conn.commit()
+        matches = conn.execute("SELECT COUNT(*) FROM remote_availability").fetchone()[0]
     except Exception:
         conn.rollback()
-        conn.close()
         raise
+    finally:
+        conn.close()
 
+    return {"servers": len(remote_movies), "matches": matches}
+
+
+def main():
+    if not DB_PATH.exists():
+        sys.exit("movies.db not found. Run database.py and scanner.py first.")
+    try:
+        run_remote_refresh(interactive=True)
+    except RuntimeError as error:
+        sys.exit(str(error))
+
+    conn = sqlite3.connect(DB_PATH)
     print_summary(conn)
     conn.close()
 
 
-main()
+if __name__ == "__main__":
+    main()

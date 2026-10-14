@@ -13,6 +13,8 @@ How a movie ends up in the results (this is the heart of the filters):
     ticked Plex server, OR "Not found" is ticked and the movie has no
     files at all and isn't on any Plex server.
   * The search box narrows everything by title.
+  * The "scope" (All / Watched / Watchlist) decides which films are even
+    considered before any of the above applies.
 """
 
 import re
@@ -23,6 +25,12 @@ from dataclasses import dataclass, field
 
 # Display order of place kinds in the sidebar.
 KIND_ORDER = {"local": 0, "network": 1, "remote": 2}
+
+# The list scopes shown as tabs: key -> tab label.
+#   all       every film in the database
+#   watched   films with at least one dated log (diary entry or rating)
+#   watchlist films on your Letterboxd watchlist
+SCOPES = {"all": "All", "watched": "Watched", "watchlist": "Watchlist"}
 
 
 @dataclass
@@ -61,6 +69,7 @@ class MovieEntry:
     logs: list = field(default_factory=list)     # LogEntry objects, oldest first
     first_logged: str | None = None              # earliest log date
     last_logged: str | None = None               # latest log date
+    watchlist_added: str | None = None           # date added to the watchlist
 
 
 @dataclass
@@ -110,6 +119,8 @@ def describe_logs(movie):
             if log.rewatch:
                 parts.append("rewatch")
             lines.append("  " + " \u00b7 ".join(parts))
+    if movie.watchlist_added:
+        lines.append(f"On watchlist since {movie.watchlist_added}")
     return "\n".join(lines)
 
 
@@ -160,9 +171,18 @@ def get_places(conn):
     return places
 
 
-def count_movies(conn):
-    """Total number of movies in the database."""
-    return conn.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
+def count_movies(conn, scope="all"):
+    """Number of films in a scope (see SCOPES)."""
+    try:
+        if scope == "watched":
+            sql = "SELECT COUNT(DISTINCT movie_id) FROM watch_logs"
+        elif scope == "watchlist":
+            sql = "SELECT COUNT(*) FROM movies WHERE watchlist_added IS NOT NULL"
+        else:
+            sql = "SELECT COUNT(*) FROM movies"
+        return conn.execute(sql).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0  # database not upgraded yet (re-run database.py)
 
 
 def _table_exists(conn, name):
@@ -209,6 +229,7 @@ def fetch_results(
     include_not_found,
     excluded_folders,
     sort_name,
+    scope="all",
 ):
     """Return the list of MovieEntry objects matching the current filters."""
     # 1. Every movie that matches the search text.
@@ -222,9 +243,19 @@ def fetch_results(
             # A film with no logs falls back to the date it joined the watchlist.
             first = dated[0] if dated else watchlist_added
             last = dated[-1] if dated else watchlist_added
+
+            # Scope: which films are considered at all.
+            if scope == "watched" and not logs:
+                continue
+            if scope == "watchlist":
+                if not watchlist_added:
+                    continue
+                first = last = watchlist_added  # dates now mean "added to watchlist"
+
             movies[movie_id] = MovieEntry(
                 movie_id, title, year,
                 letterboxd_url=url, logs=logs, first_logged=first, last_logged=last,
+                watchlist_added=watchlist_added,
             )
 
     excluded = [_norm_path(folder) for folder in excluded_folders]
