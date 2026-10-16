@@ -6,6 +6,8 @@ Python port of the search logic from Search-MoviesOnComputer.ps1:
   * get_search_friendly_title()  <- Get-SearchFriendlyTitle
   * search_everything()          <- Search-MovieEverything (strict, then loose)
   * find_movie_files()           <- the fallback tiers in the main loop
+  * list_all_video_files()       <- every video file on the drives (for the
+                                    app's "Unmatched files" tab)
   * match_confidence()           <- Get-MatchConfidence
 
 It talks to Everything through es.exe, which asks the running Everything
@@ -24,6 +26,10 @@ ES_PATH = r"C:\Users\Amphy\Downloads\ES-1.1.0.38.x64\es.exe"
 
 # Video file types to look for (same list as the PowerShell config).
 EXTENSIONS = ["mkv", "mp4", "avi", "wmv"]
+
+# The "part before the colon" fallback is skipped when that part is shorter
+# than this many characters (after punctuation is stripped).
+MIN_COLON_PART_LENGTH = 4
 
 # Resolution tags that upgrade a match from 'basic' to 'strong'.
 # \b means "word boundary", so "1080p" matches but "x1080px" would not.
@@ -114,6 +120,9 @@ def find_movie_files(title):
             fails at tier 1 because the colon breaks the search, but
             "Animal Crossing The Movie" works here).
     Tier 3: for "Title / Alternate Title" entries, each half in turn.
+    Tier 4: for "Main Title: Subtitle" entries, just the part before the
+            colon ("Star Wars: Episode IV" -> "Star Wars"). Very short
+            leftovers are skipped; see MIN_COLON_PART_LENGTH.
     """
     results = search_everything(title)
     matched_title = title
@@ -136,7 +145,28 @@ def find_movie_files(title):
                 matched_title = part
                 break
 
+    if not results and ":" in title:
+        main_part = get_search_friendly_title(title.split(":", 1)[0])
+        # A very short leftover ("M", "Up", "It") would match hundreds of
+        # unrelated files, so only use the part before the colon when it
+        # is long enough to be specific.
+        if len(main_part) >= MIN_COLON_PART_LENGTH:
+            results = search_everything(main_part)
+            if results:
+                matched_title = main_part
+
     return results, matched_title
+
+
+def list_all_video_files():
+    """Every video file Everything knows about, as (path, size_bytes).
+
+    Same search as above but with no title words, so only the extension
+    filter applies. The scanner saves this list; the app's "Unmatched
+    files" tab shows the files from it that no movie has claimed.
+    """
+    return _run_es([], whole_word=False)
+
 
 # Years either side of the Letterboxd year that still count as a year match.
 # Set to 0 for exact-year matching only.

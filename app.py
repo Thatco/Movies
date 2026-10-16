@@ -19,7 +19,11 @@ The movie library window (PySide6 / Qt). Layout, following your sketch:
 
 All filtering rules live in queries.py; this file only builds widgets,
 reads their state, and shows the results. The database is opened
-read-only, so the UI can never damage your data.
+read-only for browsing. The only things the UI ever writes are your
+confirmations (Confirm menu, toolbar, Space key, right-click), and those go
+through links.py on a short-lived separate connection.
+
+Tabs above the list: All / Watched / Watchlist / Confirmed / Unmatched files.
 
 Run with:  python app.py
 Requires:  python -m pip install PySide6
@@ -51,11 +55,14 @@ from PySide6.QtGui import (
     QFontMetrics,
     QGuiApplication,
     QKeySequence,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGroupBox,
     QHeaderView,
@@ -63,6 +70,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -81,6 +89,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import links
 import queries
 import scanner
 from settings import load_settings, save_settings
@@ -97,6 +106,10 @@ REFRESH_DELAY_MS = 200
 SAVE_DELAY_MS = 1000
 
 CONFIDENCE_ICONS = {"strong": "✅", "basic": "🟡", "low": "⚠️"}
+CONFIRMED_LABEL = "✔ Confirmed"
+
+# Tabs that don't use the Confidence checkboxes.
+SCOPES_WITHOUT_CONFIDENCE = ("confirmed", "unmatched")
 
 # Zoom: the whole UI font is scaled between these limits, in these steps.
 ZOOM_STEP = 0.1
@@ -275,6 +288,72 @@ class TaskWorker(QObject):
             self.finished.emit(None, error)
 
 
+class LinkMovieDialog(QDialog):
+    """Pick which movie a file belongs to, with a type-ahead search.
+
+    Type any words of the title (any order, accents ignored); Up/Down move
+    through the matches while the cursor stays in the search box, and Enter
+    accepts. selected_movie() then gives (movie_id, title, year).
+    """
+
+    def __init__(self, parent, file_label, choices, initial_text):
+        super().__init__(parent)
+        self.setWindowTitle("Link to a movie")
+        self.choices = choices
+
+        label = QLabel(file_label)
+        label.setTextFormat(Qt.PlainText)  # file names can contain < and &
+        label.setWordWrap(True)
+
+        self.search = QLineEdit(initial_text)
+        self.search.setPlaceholderText("Type part of the movie's title...")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._refilter)
+        self.search.installEventFilter(self)
+
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _item: self.accept())
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Link")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(label)
+        layout.addWidget(self.search)
+        layout.addWidget(self.list, stretch=1)
+        layout.addWidget(self.buttons)
+        self.resize(520, 480)
+
+        self._refilter()
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def _refilter(self):
+        self.list.clear()
+        for choice in queries.filter_choices(self.choices, self.search.text()):
+            text = f"{choice.title} ({choice.year})" if choice.year else choice.title
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, (choice.movie_id, choice.title, choice.year))
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(self.list.count() > 0)
+
+    def eventFilter(self, obj, event):
+        """Let the arrow keys drive the list while typing in the search box."""
+        if (obj is self.search and event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Down, Qt.Key_Up, Qt.Key_PageDown, Qt.Key_PageUp)):
+            QApplication.sendEvent(self.list, event)
+            return True
+        return super().eventFilter(obj, event)
+
+    def selected_movie(self):
+        item = self.list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+
 class MainWindow(QMainWindow):
     def __init__(self, conn):
         super().__init__()
@@ -302,6 +381,7 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._task_notes = []
         self.last_scan_seconds = None  # how long the last rescan took
+        self.results = []              # the movies currently listed (for auto-confirm)
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(SAVE_DELAY_MS)
@@ -384,6 +464,17 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
+        # Shift/Ctrl-click several rows to confirm (or link) them together.
+        self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        # Enter / double-click on a row in the Unmatched files tab opens the
+        # "link to a movie" picker.
+        self.tree.itemActivated.connect(self._on_item_activated)
+        # Space confirms / un-confirms the selected file rows. It is tied to
+        # the tree itself (not the whole window) so typing a space in the
+        # search box still works.
+        self.confirm_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self.tree)
+        self.confirm_shortcut.setContext(Qt.WidgetShortcut)
+        self.confirm_shortcut.activated.connect(self.toggle_confirm_selected)
         expand_button.clicked.connect(self.tree.expandAll)
         collapse_button.clicked.connect(self.tree.collapseAll)
 
@@ -432,6 +523,7 @@ class MainWindow(QMainWindow):
         # Confidence (fixed choices). Defaults match your preference:
         # trusted matches on, noisy low matches and "not found" off.
         self.confidence_section = CollapsibleSection("Confidence", expanded=True)
+        self.confidence_section.add_checkbox("✔ Confirmed", True, "confirmed", key="confirmed")
         self.confidence_section.add_checkbox("✅ Strong", True, "strong", key="strong")
         self.confidence_section.add_checkbox("🟡 Basic", True, "basic", key="basic")
         self.confidence_section.add_checkbox("⚠️ Low", False, "low", key="low")
@@ -595,6 +687,24 @@ class MainWindow(QMainWindow):
 
     def refresh(self):
         """Run the query for the current filters and redraw everything."""
+        scope = self.scope_key()
+        # The Confirmed and Unmatched tabs ignore the Confidence boxes, and
+        # Unmatched is a list of files, so sorting by movie doesn't apply.
+        self.confidence_section.setEnabled(scope not in SCOPES_WITHOUT_CONFIDENCE)
+        self.sort_box.setEnabled(scope != "unmatched")
+
+        if scope == "unmatched":
+            self.results = []
+            files = queries.fetch_unmatched(
+                self.conn,
+                search=self.search_box.text(),
+                local_place_ids=self._checked_place_ids(["local", "network"]),
+                excluded_folders=self._excluded_folders(),
+            )
+            self._fill_unmatched_tree(files)
+            self._update_info_unmatched(files)
+            return
+
         confidence_choices = self.confidence_section.checked_data()
         results = queries.fetch_results(
             self.conn,
@@ -605,10 +715,43 @@ class MainWindow(QMainWindow):
             include_not_found="not_found" in confidence_choices,
             excluded_folders=self._excluded_folders(),
             sort_name=self.sort_box.currentText(),
-            scope=self.scope_key(),
+            scope=scope,
         )
+        self.results = results
         self._fill_tree(results)
         self._update_info(results)
+
+    def _all_tree_items(self):
+        """Every row in the tree in on-screen order (movies, then their files)."""
+        items = []
+        for index in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(index)
+            items.append(top)
+            items.extend(top.child(i) for i in range(top.childCount()))
+        return items
+
+    def refresh_keep_position(self):
+        """Refresh, then put the scroll position and selected row back.
+
+        A plain refresh() rebuilds the tree and jumps to the top. After
+        confirming something that would be annoying when you're working
+        down a long list, so this restores where you were. If the selected
+        row disappeared (a confirmed file leaving the list because the
+        Confirmed box is unticked), the row now in its place is selected,
+        which is the next one down.
+        """
+        scrollbar = self.tree.verticalScrollBar()
+        scroll = scrollbar.value()
+        items = self._all_tree_items()
+        current = self.tree.currentItem()
+        position = items.index(current) if current in items else None
+
+        self.refresh()
+
+        items = self._all_tree_items()
+        if position is not None and items:
+            self.tree.setCurrentItem(items[min(position, len(items) - 1)])
+        scrollbar.setValue(scroll)
 
     def _fill_tree(self, results):
         # Turning off repainting while we add thousands of rows is much faster.
@@ -617,8 +760,11 @@ class MainWindow(QMainWindow):
         bold = QFont(self.tree.font())
         bold.setBold(True)
         sort_name = self.sort_box.currentText()
-        # In the Watchlist scope the date column means "added to watchlist".
-        self.tree.headerItem().setText(5, "Added" if self.scope_key() == "watchlist" else "Logged")
+        # Column titles (the Unmatched tab uses different ones). In the
+        # Watchlist scope the date column means "added to watchlist".
+        date_title = "Added" if self.scope_key() == "watchlist" else "Logged"
+        for column, title in enumerate(("Movie / File", "Year", "Match", "Size", "Place", date_title)):
+            self.tree.headerItem().setText(column, title)
 
         for movie in results:
             logged = queries.displayed_date(movie, sort_name) or ""
@@ -637,15 +783,21 @@ class MainWindow(QMainWindow):
                 top.setText(2, "❌ Not found")
             elif not movie.files:
                 top.setText(2, "☁ Plex only")
+            elif any(f.confirmed for f in movie.files):
+                top.setText(2, CONFIRMED_LABEL)
 
             for f in movie.files:
+                label = CONFIRMED_LABEL if f.confirmed else (
+                    f"{CONFIDENCE_ICONS[f.confidence]} {f.confidence.capitalize()}"
+                )
                 child = QTreeWidgetItem(top, [
-                    f.path, "",
-                    f"{CONFIDENCE_ICONS[f.confidence]} {f.confidence.capitalize()}",
+                    f.path, "", label,
                     queries.format_size(f.size_bytes), f.place_name,
                 ])
-                # Stash the path on the row so the right-click menu can use it.
+                # Stash the path on the row so the right-click menu can use it,
+                # and (movie, path, size, confirmed) for confirming it.
                 child.setData(0, Qt.UserRole, f.path)
+                child.setData(0, Qt.UserRole + 2, (movie.movie_id, f.path, f.size_bytes, f.confirmed))
             for server in movie.servers:
                 QTreeWidgetItem(top, [f"Available on {server}", "", "☁ Plex", "", server])
 
@@ -656,9 +808,16 @@ class MainWindow(QMainWindow):
         summary = queries.summarize(results)
         scope = self.scope_key()
         total = queries.count_movies(self.conn, scope)
-        scope_noun = {"all": "movies", "watched": "watched movies", "watchlist": "watchlist movies"}[scope]
+        scope_noun = {
+            "all": "movies",
+            "watched": "watched movies",
+            "watchlist": "watchlist movies",
+            "confirmed": "confirmed movies",
+        }[scope]
+        confirmed_total = queries.count_movies(self.conn, "confirmed")
         lines = [
             f"<b>{summary.movies}</b> of {total} {scope_noun} shown",
+            f"✔ <b>{confirmed_total}</b> confirmed",
             f"<b>{summary.files}</b> {'file' if summary.files == 1 else 'files'} &middot; "
             f"<b>{queries.format_size(summary.total_bytes) or '0 MB'}</b>",
         ]
@@ -671,8 +830,47 @@ class MainWindow(QMainWindow):
         self.info_label.setText("<br>".join(lines))
         self._set_status(f"Showing {summary.movies} of {total} {scope_noun} ({summary.files} files)")
 
+    def _fill_unmatched_tree(self, files):
+        """The Unmatched files tab: one flat row per file nobody has claimed."""
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+        for column, title in enumerate(("File", "", "", "Size", "Place", "")):
+            self.tree.headerItem().setText(column, title)
+        for f in files:
+            item = QTreeWidgetItem([f.path, "", "", queries.format_size(f.size_bytes), f.place_name, ""])
+            item.setToolTip(0, f.path)
+            item.setData(0, Qt.UserRole, f.path)                      # right-click menu
+            item.setData(0, Qt.UserRole + 3, (f.path, f.size_bytes))  # linking it
+            self.tree.addTopLevelItem(item)
+        self.tree.setUpdatesEnabled(True)
+
+    def _update_info_unmatched(self, files):
+        if not queries.has_file_catalog(self.conn):
+            self.info_label.setText(
+                "No file list yet. Run <b>Rescan Drives</b> once to build it."
+            )
+            self._set_status("Unmatched files: rescan your drives to build the file list")
+            return
+        total_bytes = sum(f.size_bytes or 0 for f in files)
+        per_place = {}
+        for f in files:
+            count, size = per_place.get(f.place_name, (0, 0))
+            per_place[f.place_name] = (count + 1, size + (f.size_bytes or 0))
+        noun = "file" if len(files) == 1 else "files"
+        lines = [
+            f"<b>{len(files)}</b> unmatched {noun}",
+            f"<b>{queries.format_size(total_bytes) or '0 MB'}</b>",
+            "<i>Select a file and press Space (or double-click) to link it to a movie.</i>",
+        ]
+        if per_place:
+            lines.append("<br><i>Per drive / share:</i>")
+            for name, (count, size) in sorted(per_place.items(), key=lambda kv: -kv[1][1]):
+                lines.append(f"{name} &mdash; {count}, {queries.format_size(size) or '0 MB'}")
+        self.info_label.setText("<br>".join(lines))
+        self._set_status(f"{len(files)} unmatched {noun}")
+
     def scope_key(self):
-        """'all', 'watched' or 'watchlist', from the tab that's selected."""
+        """The key of the selected tab: 'all', 'watched', 'watchlist', 'confirmed' or 'unmatched'."""
         return self.scope_keys[self.scope_bar.currentIndex()]
 
     def _set_status(self, text):
@@ -704,14 +902,45 @@ class MainWindow(QMainWindow):
         self.plex_action.setToolTip("Check your friends' Plex servers for your movies")
         self.plex_action.triggered.connect(self.refresh_plex)
 
+        # Auto-confirm buttons (each one asks "are you sure?" first).
+        self.confirm_strong_action = QAction(
+            style.standardIcon(QStyle.SP_DialogApplyButton), "Confirm Strong", self
+        )
+        self.confirm_strong_action.setToolTip(
+            "Confirm every Strong match that has exactly one candidate file"
+        )
+        self.confirm_strong_action.triggered.connect(lambda: self.auto_confirm("strong"))
+
+        self.confirm_basic_action = QAction(
+            style.standardIcon(QStyle.SP_DialogApplyButton), "Confirm Basic", self
+        )
+        self.confirm_basic_action.setToolTip(
+            "Confirm every Basic match that has exactly one candidate file"
+        )
+        self.confirm_basic_action.triggered.connect(lambda: self.auto_confirm("basic"))
+
         self.toolbar.addAction(self.rescan_action)
         self.toolbar.addAction(self.plex_action)
+        self.toolbar.addSeparator()
+        self.toolbar.addAction(self.confirm_strong_action)
+        self.toolbar.addAction(self.confirm_basic_action)
         self.addToolBar(Qt.TopToolBarArea, self.toolbar)
 
         # The same actions in a menu, for keyboard and screen-reader users.
         library_menu = self.menuBar().addMenu("&Library")
         library_menu.addAction(self.rescan_action)
         library_menu.addAction(self.plex_action)
+
+        # No shortcut is attached to this menu item: a window-wide Space
+        # would steal spaces typed in the search box. The Space key is wired
+        # to the list itself instead (see _build_ui).
+        confirm_menu = self.menuBar().addMenu("&Confirm")
+        toggle_action = QAction("Confirm / Remove Confirmation on Selected (Space)", self)
+        toggle_action.triggered.connect(self.toggle_confirm_selected)
+        confirm_menu.addAction(toggle_action)
+        confirm_menu.addSeparator()
+        confirm_menu.addAction(self.confirm_strong_action)
+        confirm_menu.addAction(self.confirm_basic_action)
 
         # Progress widgets on the right of the status bar, hidden until needed.
         self.task_label = QLabel()
@@ -836,6 +1065,157 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, self._task_text, "\n".join(self._task_notes))
 
     # ------------------------------------------------------------------
+    # Confirming files and linking unmatched ones
+    # ------------------------------------------------------------------
+    def _write_links(self, action):
+        """Run a database change through links.py. Returns (ok, result)."""
+        try:
+            return True, links.run_write(DB_PATH, action)
+        except sqlite3.Error as error:
+            QMessageBox.warning(
+                self, "Couldn't save",
+                f"The change wasn't saved:\n\n{error}\n\n"
+                "If a rescan is saving right now, wait a moment and try again.",
+            )
+            return False, None
+
+    def _selected_file_rows(self):
+        """Selected file rows as (movie_id, path, size, confirmed) tuples.
+
+        A selected movie row counts as its file when it has exactly one;
+        a movie with several files makes you pick the one you mean.
+        """
+        rows = []
+        for item in self.tree.selectedItems():
+            info = item.data(0, Qt.UserRole + 2)
+            if info:
+                rows.append(info)
+            elif item.data(0, Qt.UserRole + 1):  # a movie row
+                children = [item.child(i).data(0, Qt.UserRole + 2) for i in range(item.childCount())]
+                children = [c for c in children if c]
+                if len(children) == 1:
+                    rows.append(children[0])
+        return list(dict.fromkeys(rows))  # no duplicates, same order
+
+    def toggle_confirm_selected(self):
+        """Space: confirm the selected files, or un-confirm them if they all
+        already are. In the Unmatched files tab it opens the link picker."""
+        if self.scope_key() == "unmatched":
+            self._link_selected_files()
+            return
+        rows = self._selected_file_rows()
+        if not rows:
+            self._flash_status(
+                "Select a file row first (for a movie with several files, pick the one you mean)."
+            )
+            return
+        if all(row[3] for row in rows):
+            self._set_confirmed(rows, confirm=False)
+        else:
+            self._set_confirmed([row for row in rows if not row[3]], confirm=True)
+
+    def _set_confirmed(self, rows, confirm):
+        """Confirm or un-confirm `rows` ((movie_id, path, size, confirmed) tuples)."""
+        items = [(movie_id, path, size) for movie_id, path, size, _ in rows]
+        action = links.confirm_files if confirm else links.unconfirm_files
+        ok, count = self._write_links(lambda conn: action(conn, items))
+        if not ok:
+            return
+        noun = "file" if count == 1 else "files"
+        verb = "Confirmed" if confirm else "Removed confirmation from"
+        self.refresh_keep_position()
+        self._flash_status(f"{verb} {count} {noun}.")
+
+    def _on_item_activated(self, item, _column):
+        """Enter / double-click: in the Unmatched files tab, link that file."""
+        if self.scope_key() == "unmatched":
+            self._link_selected_files()
+
+    def _link_selected_files(self):
+        """Ask which movie the selected unmatched file(s) belong to, then confirm them.
+
+        Several files can be linked to the same movie in one go (a movie
+        split over two files, or a movie plus its other-language copy).
+        """
+        selected = [i.data(0, Qt.UserRole + 3) for i in self.tree.selectedItems()]
+        selected = [info for info in selected if info]
+        if not selected:
+            self._flash_status("Select an unmatched file first.")
+            return
+
+        first_path = selected[0][0]
+        if len(selected) == 1:
+            file_label = first_path
+        else:
+            file_label = f"{len(selected)} files, starting with:\n{first_path}"
+        dialog = LinkMovieDialog(
+            self, file_label, queries.load_movie_choices(self.conn), queries.guess_title(first_path)
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        chosen = dialog.selected_movie()
+        if chosen is None:
+            return
+        movie_id, title, year = chosen
+
+        items = [(movie_id, path, size) for path, size in selected]
+        ok, _ = self._write_links(lambda conn: links.confirm_files(conn, items))
+        if not ok:
+            return
+        self.refresh_keep_position()
+        noun = "file" if len(items) == 1 else "files"
+        label = f"{title} ({year})" if year else title
+        self._flash_status(f"Linked {len(items)} {noun} to {label}.")
+
+    def auto_confirm(self, level):
+        """Confirm every unambiguous Strong (or Basic) match in the current list."""
+        if self.scope_key() in SCOPES_WITHOUT_CONFIDENCE:
+            QMessageBox.information(
+                self, "Auto-confirm",
+                "Switch to the All, Watched or Watchlist tab first. Auto-confirm "
+                "works on the movies listed there.",
+            )
+            return
+
+        name = level.capitalize()
+        plan = links.plan_auto_confirm(self.conn, self.results, level)
+        skipped = []
+        if plan.skipped_several:
+            skipped.append(f"{plan.skipped_several} with several {name} files")
+        if plan.skipped_shared:
+            skipped.append(f"{plan.skipped_shared} whose file also matches another movie")
+        if plan.skipped_done:
+            skipped.append(f"{plan.skipped_done} that already have a confirmed file")
+        skipped_text = ("Left for you to review: " + ", ".join(skipped) + ".") if skipped else ""
+
+        if not plan.items:
+            QMessageBox.information(
+                self, "Auto-confirm",
+                f"Nothing to auto-confirm: no {name} matches in the current list are "
+                f"unambiguous.\n\n{skipped_text}".rstrip(),
+            )
+            return
+
+        noun = "match" if len(plan.items) == 1 else "matches"
+        text = (
+            f"Confirm {len(plan.items)} {name} {noun}?\n\n"
+            f"Only movies with exactly one {name} file in the current list are "
+            "included, so what you see is what gets confirmed."
+        )
+        if skipped_text:
+            text += f"\n\n{skipped_text}"
+        answer = QMessageBox.question(
+            self, f"Confirm all {name}", text, QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        ok, count = self._write_links(lambda conn: links.confirm_files(conn, plan.items))
+        if ok:
+            self.refresh_keep_position()
+            self._flash_status(f"Confirmed {count} {name} {'match' if count == 1 else 'matches'}.")
+
+    # ------------------------------------------------------------------
     # Folder exclusions
     # ------------------------------------------------------------------
     def _add_excluded_folder(self):
@@ -875,11 +1255,30 @@ class MainWindow(QMainWindow):
                 # otherwise the best-effort search.
                 QDesktopServices.openUrl(QUrl(letterboxd_link or letterboxd_url(title, year)))
         elif file_path:
+            confirm_info = item.data(0, Qt.UserRole + 2)    # (movie_id, path, size, confirmed)
+            unmatched_info = item.data(0, Qt.UserRole + 3)  # (path, size), Unmatched tab only
+            confirm_action = link_action = None
+            if confirm_info:
+                confirm_action = menu.addAction(
+                    "Remove confirmation" if confirm_info[3] else "Confirm this file"
+                )
+            if unmatched_info:
+                link_action = menu.addAction("Link to movie...")
+            if confirm_action or link_action:
+                menu.addSeparator()
             reveal_action = menu.addAction("Open containing folder")
             copy_action = menu.addAction("Copy path")
             open_action = menu.addAction("Open file")
             chosen = menu.exec(self.tree.viewport().mapToGlobal(position))
-            if chosen == reveal_action:
+            if chosen is None:
+                return
+            if chosen == confirm_action:
+                self._set_confirmed([confirm_info], confirm=not confirm_info[3])
+            elif chosen == link_action:
+                if not item.isSelected():
+                    self.tree.setCurrentItem(item)
+                self._link_selected_files()
+            elif chosen == reveal_action:
                 reveal_in_file_manager(file_path)
             elif chosen == copy_action:
                 QGuiApplication.clipboard().setText(file_path)
@@ -939,10 +1338,11 @@ class MainWindow(QMainWindow):
         # Movie rows have their own (bold) font, so resize it by hand. The
         # tree itself is NOT rebuilt, so your expanded/collapsed rows and
         # scroll position stay exactly as they were.
-        bold = QFont(self.tree.font())
-        bold.setBold(True)
-        for index in range(self.tree.topLevelItemCount()):
-            self.tree.topLevelItem(index).setFont(0, bold)
+        if self.scope_key() != "unmatched":  # there, top-level rows are files
+            bold = QFont(self.tree.font())
+            bold.setBold(True)
+            for index in range(self.tree.topLevelItemCount()):
+                self.tree.topLevelItem(index).setFont(0, bold)
 
         self.schedule_save()
 
@@ -990,7 +1390,11 @@ def main():
     if not DB_PATH.exists():
         sys.exit("movies.db not found. Run database.py and scanner.py first.")
 
-    # Read-only connection: the UI can browse but never modify the data.
+    # Create the confirmation tables if an older movies.db doesn't have
+    # them yet (nothing else is touched), then open the connection the UI
+    # browses with. It is read-only; confirmations are saved through
+    # links.py on separate, short-lived connections.
+    links.ensure_database(DB_PATH)
     conn = sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True)
 
     app = QApplication(sys.argv)

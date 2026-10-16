@@ -8,6 +8,10 @@ Searches Everything for every movie in movies.db and records what it finds:
     worked out automatically from the file's path:
         D:\\Movies\\Heat.mkv           -> place "D:"            (local)
         \\\\NAS\\Share\\Heat.mkv         -> place "\\\\NAS\\Share"   (network)
+  * Every video file on the drives (matched to a movie or not) is saved in
+    the `disk_files` table; the app's "Unmatched files" tab uses it.
+  * Files you confirmed by hand (links.py) are kept across scans: they are
+    found again by name and size and put back in `locations`.
 
 Used two ways:
   * python scanner.py          from the command line (prints progress)
@@ -18,7 +22,8 @@ everything_search.py must point at es.exe.
 
 How it works, in two phases:
   1. SEARCH  - es.exe is run for every movie, several at once (see
-     SEARCH_WORKERS). Nothing is written to the database yet.
+     SEARCH_WORKERS), then once more to list every video file. Nothing is
+     written to the database yet.
   2. SAVE    - old locations are cleared and the new ones written in one
      quick all-or-nothing step.
 So a failed or cancelled search leaves the previous results untouched, and
@@ -31,7 +36,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PureWindowsPath
 
-from everything_search import find_movie_files, match_confidence
+import links
+from everything_search import find_movie_files, list_all_video_files, match_confidence
 
 HERE = Path(__file__).parent
 DB_PATH = HERE / "movies.db"
@@ -108,10 +114,11 @@ def search_all(titles, progress, cancel_event):
         pool.shutdown(wait=True, cancel_futures=True)
 
 
-def save_results(conn, movies, found):
-    """Phase 2: replace the stored locations with the new results."""
+def save_results(conn, movies, found, all_files):
+    """Phase 2: replace the stored locations and file list with the new results."""
     place_cache = {}
     conn.execute("DELETE FROM locations")  # places are kept; they're just drives
+    conn.execute("DELETE FROM disk_files")
     for (movie_id, _title, year), files in zip(movies, found):
         for path, size in files:
             place = place_for_path(path)
@@ -124,6 +131,20 @@ def save_results(conn, movies, found):
                 (movie_id, place_id, path, size, match_confidence(path, year)),
             )
 
+    # Every video file Everything knows about, claimed by a movie or not.
+    for path, size in all_files:
+        place = place_for_path(path)
+        if place is None:
+            continue
+        place_id = get_place_id(conn, place_cache, *place)
+        conn.execute(
+            "INSERT OR IGNORE INTO disk_files (path, place_id, size_bytes) VALUES (?, ?, ?)",
+            (path, place_id, size),
+        )
+
+    # Put back the files you confirmed by hand (found again by name + size).
+    links.restore_confirmed_locations(conn)
+
 
 def run_scan(db_path=DB_PATH, progress=None, cancel_event=None):
     """Do a full rescan. Returns how many seconds it took.
@@ -134,14 +155,22 @@ def run_scan(db_path=DB_PATH, progress=None, cancel_event=None):
     """
     started = time.time()
 
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON")
     try:
+        links.ensure_tables(conn)  # no-op once they exist
         movies = conn.execute("SELECT id, title, year FROM movies ORDER BY id").fetchall()
         found = search_all([title for _, title, _ in movies], progress, cancel_event)
 
+        # One more search, with no title: every video file on the drives.
+        if progress:
+            progress(0, 1, "Listing all video files")
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled()
+        all_files = list_all_video_files()
+
         try:
-            save_results(conn, movies, found)
+            save_results(conn, movies, found, all_files)
             conn.commit()  # save everything in one step
         except Exception:
             conn.rollback()  # undo a partial save; old results stay intact
@@ -157,6 +186,9 @@ def print_summary(conn):
     total = conn.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
     found = conn.execute("SELECT COUNT(DISTINCT movie_id) FROM locations").fetchone()[0]
     print(f"\n{found} of {total} movies have at least one file; {total - found} have none.")
+    confirmed = conn.execute("SELECT COUNT(DISTINCT movie_id) FROM confirmed_links").fetchone()[0]
+    listed = conn.execute("SELECT COUNT(*) FROM disk_files").fetchone()[0]
+    print(f"{confirmed} movies have a confirmed file; {listed} video files on disk in total.")
 
     # Each movie's BEST confidence across all of its files. We turn the
     # text levels into numbers (strong=3, basic=2, low=1), take the MAX
