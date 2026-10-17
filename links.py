@@ -17,8 +17,17 @@ Tables created here (safe to run repeatedly):
                    or not any movie claimed it. The app's "Unmatched files"
                    tab is built from this.
 
+  deconfirmed_links  the opposite decision: "this file is NOT this movie" (a
+                   featurette, a TV episode, something unrelated that the
+                   search happened to match). Same shape as confirmed_links.
+                   A file is either confirmed or deconfirmed for a movie, never
+                   both: setting one clears the other.
+
 A file is identified by (filename, size), not by its full path. That means
 the same file copied to two drives counts as confirmed in both places.
+
+This file also adds two columns to `movies` for the director lookup
+(directors.py): `directors` and `directors_checked`.
 
 Everything that WRITES for the UI goes through this file, so app.py can keep
 its main database connection read-only.
@@ -47,6 +56,18 @@ CREATE TABLE IF NOT EXISTS confirmed_links (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_confirmed_identity
     ON confirmed_links (movie_id, filename COLLATE NOCASE, IFNULL(size_bytes, -1));
 
+-- Same shape and same identity rule as confirmed_links.
+CREATE TABLE IF NOT EXISTS deconfirmed_links (
+    id              INTEGER PRIMARY KEY,
+    movie_id        INTEGER NOT NULL REFERENCES movies(id),
+    filename        TEXT NOT NULL,
+    size_bytes      INTEGER,
+    path            TEXT,
+    deconfirmed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deconfirmed_identity
+    ON deconfirmed_links (movie_id, filename COLLATE NOCASE, IFNULL(size_bytes, -1));
+
 CREATE TABLE IF NOT EXISTS disk_files (
     path       TEXT PRIMARY KEY,
     place_id   INTEGER NOT NULL REFERENCES places(id),
@@ -57,10 +78,20 @@ CREATE TABLE IF NOT EXISTS disk_files (
 # Confidence levels that auto-confirm is allowed to work on.
 AUTO_CONFIRM_LEVELS = ("strong", "basic")
 
+# Columns added to `movies` after the first version of the database (the
+# same migration idea as database.py's ensure_columns). directors_checked
+# records that a movie's Letterboxd page was read successfully, so the
+# lookup can be stopped and resumed without repeating itself.
+MOVIE_COLUMNS = {"directors": "TEXT", "directors_checked": "TEXT"}
+
 
 def ensure_tables(conn):
-    """Create the tables above if they don't exist yet."""
+    """Create the tables above, and the extra movie columns, if missing."""
     conn.executescript(SCHEMA)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(movies)")}
+    for name, column_type in MOVIE_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE movies ADD COLUMN {name} {column_type}")
 
 
 def ensure_database(db_path):
@@ -99,13 +130,26 @@ def filename_of(path):
     return PureWindowsPath(path).name
 
 
+def _delete_decision(conn, table, movie_id, path, size):
+    """Delete one file's row from confirmed_links or deconfirmed_links."""
+    cursor = conn.execute(
+        f"DELETE FROM {table} "
+        "WHERE movie_id = ? AND filename = ? COLLATE NOCASE "
+        "AND IFNULL(size_bytes, -1) = IFNULL(?, -1)",
+        (movie_id, filename_of(path), size),
+    )
+    return cursor.rowcount
+
+
 def confirm_files(conn, items):
     """Confirm files. `items` is a list of (movie_id, path, size_bytes).
 
     Returns how many were newly confirmed (already-confirmed ones are skipped).
+    Confirming a file you had deconfirmed simply replaces that decision.
     """
     added = 0
     for movie_id, path, size in items:
+        _delete_decision(conn, "deconfirmed_links", movie_id, path, size)
         cursor = conn.execute(
             "INSERT OR IGNORE INTO confirmed_links (movie_id, filename, size_bytes, path) "
             "VALUES (?, ?, ?, ?)",
@@ -126,13 +170,38 @@ def unconfirm_files(conn, items):
     """
     removed = 0
     for movie_id, path, size in items:
+        removed += _delete_decision(conn, "confirmed_links", movie_id, path, size)
+    return removed
+
+
+def deconfirm_files(conn, items):
+    """Mark files as "not this movie". `items` is (movie_id, path, size_bytes).
+
+    Any confirmation of the same file is removed. The file stays in the
+    database (a rescan will find it again) but is hidden unless the
+    Deconfirmed box is ticked, and it no longer counts as a match for that
+    movie. Returns how many were newly deconfirmed.
+    """
+    added = 0
+    for movie_id, path, size in items:
+        _delete_decision(conn, "confirmed_links", movie_id, path, size)
         cursor = conn.execute(
-            "DELETE FROM confirmed_links "
-            "WHERE movie_id = ? AND filename = ? COLLATE NOCASE "
-            "AND IFNULL(size_bytes, -1) = IFNULL(?, -1)",
-            (movie_id, filename_of(path), size),
+            "INSERT OR IGNORE INTO deconfirmed_links (movie_id, filename, size_bytes, path) "
+            "VALUES (?, ?, ?, ?)",
+            (movie_id, filename_of(path), size, path),
         )
-        removed += cursor.rowcount
+        added += cursor.rowcount
+    return added
+
+
+def undeconfirm_files(conn, items):
+    """Take back a deconfirmation: the file returns to its scanned confidence.
+
+    Returns how many deconfirmations were removed.
+    """
+    removed = 0
+    for movie_id, path, size in items:
+        removed += _delete_decision(conn, "deconfirmed_links", movie_id, path, size)
     return removed
 
 
@@ -190,7 +259,8 @@ def plan_auto_confirm(conn, results, level):
 
     `results` is the list of MovieEntry objects currently on screen. A movie
     is confirmed automatically only when it is unambiguous:
-      * it has exactly one (unconfirmed) file at `level` in the current list,
+      * it has exactly one (neither confirmed nor deconfirmed) file at
+        `level` in the current list,
       * it has no confirmed file yet, and
       * that file isn't also a strong/basic candidate for a different movie
         (the classic case is a sequel whose title shares a first half with
@@ -198,17 +268,30 @@ def plan_auto_confirm(conn, results, level):
     Anything else is counted and left for you to review by hand.
     """
     already = {row[0] for row in conn.execute("SELECT DISTINCT movie_id FROM confirmed_links")}
-    shared = {
-        path.casefold()
-        for (path,) in conn.execute(
-            "SELECT path FROM locations WHERE confidence IN ('strong', 'basic') "
-            "GROUP BY path HAVING COUNT(DISTINCT movie_id) > 1"
+
+    # Which movies each strong/basic file is a candidate for, not counting
+    # pairs you have deconfirmed (a file you rejected for one movie no longer
+    # makes it ambiguous for another).
+    rejected = {
+        (movie_id, name.casefold(), size)
+        for movie_id, name, size in conn.execute(
+            "SELECT movie_id, filename, size_bytes FROM deconfirmed_links"
         )
     }
+    claimants = defaultdict(set)
+    for movie_id, path, size in conn.execute(
+        "SELECT movie_id, path, size_bytes FROM locations WHERE confidence IN ('strong', 'basic')"
+    ):
+        if (movie_id, filename_of(path).casefold(), size) not in rejected:
+            claimants[path.casefold()].add(movie_id)
+    shared = {path for path, movie_ids in claimants.items() if len(movie_ids) > 1}
 
     plan = AutoConfirmPlan()
     for movie in results:
-        candidates = [f for f in movie.files if f.confidence == level and not f.confirmed]
+        candidates = [
+            f for f in movie.files
+            if f.confidence == level and not f.confirmed and not f.deconfirmed
+        ]
         if not candidates:
             continue
         if movie.movie_id in already:

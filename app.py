@@ -20,10 +20,17 @@ The movie library window (PySide6 / Qt). Layout, following your sketch:
 All filtering rules live in queries.py; this file only builds widgets,
 reads their state, and shows the results. The database is opened
 read-only for browsing. The only things the UI ever writes are your
-confirmations (Confirm menu, toolbar, Space key, right-click), and those go
-through links.py on a short-lived separate connection.
+confirmations and deconfirmations (Confirm menu, toolbar, Space / Backspace
+keys, right-click), and those go through links.py on a short-lived separate
+connection. (The director lookup, directors.py, writes on its own connection
+too, only while "Get Directors" is running.)
 
-Tabs above the list: All / Watched / Watchlist / Confirmed / Unmatched files.
+Tabs above the list: All / Watched / Watchlist / Confirmed / Deconfirmed /
+Unmatched files.
+
+Keys (with file rows selected in the list):
+    Space      confirm / remove confirmation   (Unmatched tab: link to a movie)
+    Backspace  deconfirm ("not this movie") / restore
 
 Run with:  python app.py
 Requires:  python -m pip install PySide6
@@ -40,6 +47,7 @@ from PySide6.QtCore import (
     QByteArray,
     QEvent,
     QObject,
+    QRect,
     QSize,
     Qt,
     QThread,
@@ -50,11 +58,14 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QColor,
     QDesktopServices,
     QFont,
     QFontMetrics,
     QGuiApplication,
     QKeySequence,
+    QPainter,
+    QPen,
     QShortcut,
 )
 from PySide6.QtWidgets import (
@@ -89,6 +100,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import directors
 import links
 import queries
 import scanner
@@ -107,9 +119,21 @@ SAVE_DELAY_MS = 1000
 
 CONFIDENCE_ICONS = {"strong": "✅", "basic": "🟡", "low": "⚠️"}
 CONFIRMED_LABEL = "✔ Confirmed"
+DECONFIRMED_LABEL = "🚫 Deconfirmed"
 
 # Tabs that don't use the Confidence checkboxes.
-SCOPES_WITHOUT_CONFIDENCE = ("confirmed", "unmatched")
+SCOPES_WITHOUT_CONFIDENCE = ("confirmed", "deconfirmed", "unmatched")
+
+# The translucent green box around confirmed file rows (red, green, blue,
+# alpha out of 255). Low alpha keeps the text readable on light and dark themes.
+CONFIRMED_FILL = QColor(46, 160, 67, 38)
+CONFIRMED_BORDER = QColor(46, 160, 67, 170)
+
+# Column titles in their fixed (logical) order. The Director column is last
+# here but is moved to sit after Year on screen (see _build_ui); you can drag
+# columns into any order and the order is remembered.
+COLUMN_COUNT = 7
+DIRECTOR_COLUMN = 6
 
 # Zoom: the whole UI font is scaled between these limits, in these steps.
 ZOOM_STEP = 0.1
@@ -354,6 +378,41 @@ class LinkMovieDialog(QDialog):
         return item.data(Qt.UserRole) if item else None
 
 
+class FileTree(QTreeWidget):
+    """The results tree, plus an optional green box around confirmed files.
+
+    Rows whose first cell carries CONFIRMED_ROLE data get a translucent
+    green rounded box across the full row, drawn on top of the normal row
+    so it still shows when the row is selected. Turn it off by setting
+    `highlight_confirmed = False` (the View menu does this).
+    """
+
+    CONFIRMED_ROLE = Qt.UserRole + 4
+
+    def __init__(self):
+        super().__init__()
+        self.highlight_confirmed = True
+
+    def drawRow(self, painter, option, index):
+        super().drawRow(painter, option, index)
+        if not self.highlight_confirmed:
+            return
+        item = self.itemFromIndex(index)
+        if item is None or not item.data(0, self.CONFIRMED_ROLE):
+            return
+        # Span every column, and follow horizontal scrolling.
+        box = QRect(
+            -self.horizontalOffset(), option.rect.top(),
+            self.header().length(), option.rect.height(),
+        ).adjusted(1, 1, -2, -1)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(CONFIRMED_BORDER, 1.2))
+        painter.setBrush(CONFIRMED_FILL)
+        painter.drawRoundedRect(box, 3, 3)
+        painter.restore()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, conn):
         super().__init__()
@@ -382,6 +441,7 @@ class MainWindow(QMainWindow):
         self._task_notes = []
         self.last_scan_seconds = None  # how long the last rescan took
         self.results = []              # the movies currently listed (for auto-confirm)
+        self._header_restored = False  # True if saved column widths were loaded
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(SAVE_DELAY_MS)
@@ -397,6 +457,10 @@ class MainWindow(QMainWindow):
         self._apply_settings(load_settings())
         self.set_zoom(self.zoom_factor)  # applies fonts at the restored zoom
         self.refresh()                   # first fill of the results tree
+        if not self._header_restored:
+            # No saved column widths yet: size them to fit once the window is
+            # on screen (so the width of the list is known).
+            QTimer.singleShot(0, self.fit_columns)
         self._ready = True
 
     # ------------------------------------------------------------------
@@ -451,17 +515,22 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(controls_row)
 
         # --- Results tree (right side) ---
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Movie / File", "Year", "Match", "Size", "Place", "Logged"])
+        self.tree = FileTree()
+        self.tree.setHeaderLabels(
+            ["Movie / File", "Year", "Match", "Size", "Place", "Logged", "Director"]
+        )
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
-        # The first column takes the leftover space; the others fit their
-        # contents, so nothing is cut off at any zoom level.
+        # Every column can be dragged to resize (double-click a divider to fit
+        # that column to its contents) and dragged to reorder. Widths and
+        # order are remembered between runs.
         header = self.tree.header()
-        header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in (1, 2, 3, 4, 5):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        header.setSectionsMovable(True)
+        header.setMinimumSectionSize(40)
+        header.moveSection(DIRECTOR_COLUMN, 2)  # Director sits after Year
+        self._setup_header_modes()
+        header.sectionResized.connect(self.schedule_save)
+        header.sectionMoved.connect(self.schedule_save)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
         # Shift/Ctrl-click several rows to confirm (or link) them together.
@@ -475,6 +544,10 @@ class MainWindow(QMainWindow):
         self.confirm_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self.tree)
         self.confirm_shortcut.setContext(Qt.WidgetShortcut)
         self.confirm_shortcut.activated.connect(self.toggle_confirm_selected)
+        # Backspace deconfirms ("this file is not this movie") or restores.
+        self.deconfirm_shortcut = QShortcut(QKeySequence(Qt.Key_Backspace), self.tree)
+        self.deconfirm_shortcut.setContext(Qt.WidgetShortcut)
+        self.deconfirm_shortcut.activated.connect(self.toggle_deconfirm_selected)
         expand_button.clicked.connect(self.tree.expandAll)
         collapse_button.clicked.connect(self.tree.collapseAll)
 
@@ -527,6 +600,7 @@ class MainWindow(QMainWindow):
         self.confidence_section.add_checkbox("✅ Strong", True, "strong", key="strong")
         self.confidence_section.add_checkbox("🟡 Basic", True, "basic", key="basic")
         self.confidence_section.add_checkbox("⚠️ Low", False, "low", key="low")
+        self.confidence_section.add_checkbox("🚫 Deconfirmed", False, "deconfirmed", key="deconfirmed")
         self.confidence_section.add_checkbox("❌ Not found", False, "not_found", key="not_found")
         self.confidence_section.changed.connect(self.schedule_refresh)
         self.confidence_section.toggle_button.clicked.connect(self.schedule_save)
@@ -600,6 +674,9 @@ class MainWindow(QMainWindow):
             "splitter": self.splitter.sizes(),
             "sort": self.sort_box.currentText(),
             "scope": self.scope_key(),
+            # Column widths and order, packed as text for the JSON file.
+            "header": bytes(self.tree.header().saveState().toBase64()).decode("ascii"),
+            "highlight_confirmed": self.highlight_action.isChecked(),
             "last_scan_seconds": self.last_scan_seconds,
             "excluded_folders": self._excluded_folders(),
             "sections": sections,
@@ -638,6 +715,18 @@ class MainWindow(QMainWindow):
         seconds = saved.get("last_scan_seconds")
         if isinstance(seconds, (int, float)):
             self.last_scan_seconds = float(seconds)
+
+        header_state = saved.get("header")
+        if isinstance(header_state, str):
+            restored = self.tree.header().restoreState(
+                QByteArray.fromBase64(header_state.encode("ascii"))
+            )
+            self._header_restored = bool(restored)
+            self._setup_header_modes()  # restoring can change the resize modes
+
+        highlight = saved.get("highlight_confirmed")
+        if isinstance(highlight, bool):
+            self.highlight_action.setChecked(highlight)
 
         self._apply_filter_state(saved)
 
@@ -684,6 +773,54 @@ class MainWindow(QMainWindow):
 
     def _excluded_folders(self):
         return [self.exclude_list.item(i).text() for i in range(self.exclude_list.count())]
+
+    def _setup_header_modes(self):
+        """Make every column manually resizable (and not stretching)."""
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.Interactive)
+
+    def _column_minimums(self):
+        """The least width each column should have, whatever is listed right now.
+
+        Columns no longer resize themselves as the list changes, so "fit to
+        contents" must also leave room for text that isn't on screen yet
+        (a "Deconfirmed" label, a long director name, a 4-digit year).
+        """
+        metrics = QFontMetrics(self.tree.font())
+
+        def wide(text):
+            return metrics.horizontalAdvance(text) + 28  # cell padding + icon room
+
+        labels = (CONFIRMED_LABEL, DECONFIRMED_LABEL, "❌ Not found", "☁ Plex only", "⚠️ Low")
+        return {
+            1: wide("0000"),
+            2: max(wide(text) for text in labels),
+            3: wide("999.9 GB"),
+            4: wide("D:"),
+            5: wide("0000-00-00"),
+            DIRECTOR_COLUMN: wide("Christopher Nolan"),
+        }
+
+    def _fit_column(self, column):
+        """Fit one column to its contents (at least its minimum; Director is
+        capped so one long list of names can't swallow the window)."""
+        self.tree.resizeColumnToContents(column)
+        header = self.tree.header()
+        minimum = self._column_minimums().get(column, 0)
+        width = max(header.sectionSize(column), minimum)
+        if column == DIRECTOR_COLUMN:
+            width = min(width, minimum * 2)
+        header.resizeSection(column, width)
+
+    def fit_columns(self):
+        """Size the columns to their contents; the first column gets the rest."""
+        header = self.tree.header()
+        for column in range(1, header.count()):
+            self._fit_column(column)
+        others = sum(header.sectionSize(column) for column in range(1, header.count()))
+        header.resizeSection(0, max(300, self.tree.viewport().width() - others))
+        self.schedule_save()
 
     def refresh(self):
         """Run the query for the current filters and redraw everything."""
@@ -763,13 +900,18 @@ class MainWindow(QMainWindow):
         # Column titles (the Unmatched tab uses different ones). In the
         # Watchlist scope the date column means "added to watchlist".
         date_title = "Added" if self.scope_key() == "watchlist" else "Logged"
-        for column, title in enumerate(("Movie / File", "Year", "Match", "Size", "Place", date_title)):
+        titles = ("Movie / File", "Year", "Match", "Size", "Place", date_title, "Director")
+        for column, title in enumerate(titles):
             self.tree.headerItem().setText(column, title)
 
         for movie in results:
             logged = queries.displayed_date(movie, sort_name) or ""
-            top = QTreeWidgetItem([movie.title, str(movie.year or ""), "", "", "", logged])
+            top = QTreeWidgetItem(
+                [movie.title, str(movie.year or ""), "", "", "", logged, movie.directors or ""]
+            )
             top.setFont(0, bold)
+            if movie.directors:
+                top.setToolTip(DIRECTOR_COLUMN, movie.directors)
             # Stash (title, year, Letterboxd link) for the right-click menu.
             top.setData(0, Qt.UserRole + 1, (movie.title, movie.year, movie.letterboxd_url))
             # Hovering a movie lists every dated log (rewatches included).
@@ -785,19 +927,30 @@ class MainWindow(QMainWindow):
                 top.setText(2, "☁ Plex only")
             elif any(f.confirmed for f in movie.files):
                 top.setText(2, CONFIRMED_LABEL)
+            elif all(f.deconfirmed for f in movie.files):
+                top.setText(2, DECONFIRMED_LABEL)
 
             for f in movie.files:
-                label = CONFIRMED_LABEL if f.confirmed else (
-                    f"{CONFIDENCE_ICONS[f.confidence]} {f.confidence.capitalize()}"
-                )
+                if f.confirmed:
+                    label = CONFIRMED_LABEL
+                elif f.deconfirmed:
+                    label = DECONFIRMED_LABEL
+                else:
+                    label = f"{CONFIDENCE_ICONS[f.confidence]} {f.confidence.capitalize()}"
                 child = QTreeWidgetItem(top, [
                     f.path, "", label,
                     queries.format_size(f.size_bytes), f.place_name,
                 ])
+                child.setToolTip(0, f.path)  # the full path, however narrow the column
                 # Stash the path on the row so the right-click menu can use it,
-                # and (movie, path, size, confirmed) for confirming it.
+                # and (movie, path, size, confirmed, deconfirmed) for the
+                # Space / Backspace keys.
                 child.setData(0, Qt.UserRole, f.path)
-                child.setData(0, Qt.UserRole + 2, (movie.movie_id, f.path, f.size_bytes, f.confirmed))
+                child.setData(0, Qt.UserRole + 2, (
+                    movie.movie_id, f.path, f.size_bytes, f.confirmed, f.deconfirmed,
+                ))
+                if f.confirmed:
+                    child.setData(0, FileTree.CONFIRMED_ROLE, True)  # gets the green box
             for server in movie.servers:
                 QTreeWidgetItem(top, [f"Available on {server}", "", "☁ Plex", "", server])
 
@@ -813,11 +966,17 @@ class MainWindow(QMainWindow):
             "watched": "watched movies",
             "watchlist": "watchlist movies",
             "confirmed": "confirmed movies",
+            "deconfirmed": "movies with deconfirmed files",
         }[scope]
         confirmed_total = queries.count_movies(self.conn, "confirmed")
+        deconfirmed_total = queries.count_movies(self.conn, "deconfirmed")
         lines = [
             f"<b>{summary.movies}</b> of {total} {scope_noun} shown",
             f"✔ <b>{confirmed_total}</b> confirmed",
+        ]
+        if deconfirmed_total:
+            lines.append(f"🚫 <b>{deconfirmed_total}</b> with deconfirmed files")
+        lines += [
             f"<b>{summary.files}</b> {'file' if summary.files == 1 else 'files'} &middot; "
             f"<b>{queries.format_size(summary.total_bytes) or '0 MB'}</b>",
         ]
@@ -834,7 +993,7 @@ class MainWindow(QMainWindow):
         """The Unmatched files tab: one flat row per file nobody has claimed."""
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
-        for column, title in enumerate(("File", "", "", "Size", "Place", "")):
+        for column, title in enumerate(("File", "", "", "Size", "Place", "", "")):
             self.tree.headerItem().setText(column, title)
         for f in files:
             item = QTreeWidgetItem([f.path, "", "", queries.format_size(f.size_bytes), f.place_name, ""])
@@ -902,6 +1061,14 @@ class MainWindow(QMainWindow):
         self.plex_action.setToolTip("Check your friends' Plex servers for your movies")
         self.plex_action.triggered.connect(self.refresh_plex)
 
+        self.directors_action = QAction(
+            style.standardIcon(QStyle.SP_FileDialogDetailedView), "Get Directors", self
+        )
+        self.directors_action.setToolTip(
+            "Look up each movie's director(s) on Letterboxd (resumes where it left off)"
+        )
+        self.directors_action.triggered.connect(self.fetch_directors)
+
         # Auto-confirm buttons (each one asks "are you sure?" first).
         self.confirm_strong_action = QAction(
             style.standardIcon(QStyle.SP_DialogApplyButton), "Confirm Strong", self
@@ -921,6 +1088,7 @@ class MainWindow(QMainWindow):
 
         self.toolbar.addAction(self.rescan_action)
         self.toolbar.addAction(self.plex_action)
+        self.toolbar.addAction(self.directors_action)
         self.toolbar.addSeparator()
         self.toolbar.addAction(self.confirm_strong_action)
         self.toolbar.addAction(self.confirm_basic_action)
@@ -930,14 +1098,19 @@ class MainWindow(QMainWindow):
         library_menu = self.menuBar().addMenu("&Library")
         library_menu.addAction(self.rescan_action)
         library_menu.addAction(self.plex_action)
+        library_menu.addAction(self.directors_action)
 
-        # No shortcut is attached to this menu item: a window-wide Space
-        # would steal spaces typed in the search box. The Space key is wired
-        # to the list itself instead (see _build_ui).
+        # No shortcut is attached to these menu items: a window-wide Space
+        # would steal spaces typed in the search box (and Backspace would
+        # steal deletes). The keys are wired to the list itself instead
+        # (see _build_ui).
         confirm_menu = self.menuBar().addMenu("&Confirm")
         toggle_action = QAction("Confirm / Remove Confirmation on Selected (Space)", self)
         toggle_action.triggered.connect(self.toggle_confirm_selected)
         confirm_menu.addAction(toggle_action)
+        deconfirm_action = QAction("Deconfirm / Restore Selected (Backspace)", self)
+        deconfirm_action.triggered.connect(self.toggle_deconfirm_selected)
+        confirm_menu.addAction(deconfirm_action)
         confirm_menu.addSeparator()
         confirm_menu.addAction(self.confirm_strong_action)
         confirm_menu.addAction(self.confirm_basic_action)
@@ -987,6 +1160,61 @@ class MainWindow(QMainWindow):
 
         self._start_task("Refreshing Plex", task, self._plex_done)
 
+    def fetch_directors(self):
+        """Look up directors on Letterboxd for every movie that lacks them."""
+        if self._thread is not None:
+            return
+        try:
+            pending = directors.count_pending(DB_PATH)
+        except sqlite3.Error as error:
+            QMessageBox.warning(self, "Get Directors", f"Couldn't read the database:\n\n{error}")
+            return
+        if pending == 0:
+            QMessageBox.information(
+                self, "Get Directors",
+                "Every movie with a Letterboxd link already has its directors.",
+            )
+            return
+        minutes = max(1, round(pending * (directors.REQUEST_DELAY + 0.5) / 60))
+        answer = QMessageBox.question(
+            self, "Get Directors",
+            f"Look up directors for {pending} movies on Letterboxd?\n\n"
+            f"One page per 5 seconds, so about {minutes} minute{'s' if minutes != 1 else ''}. "
+            "You can keep using the program, and you can cancel any time: "
+            "what's fetched is saved, and the next run carries on from there.",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._start_task(
+            "Getting directors",
+            lambda progress, note, cancel: directors.fetch_directors(
+                DB_PATH, progress=progress, cancel_event=cancel
+            ),
+            self._directors_done,
+        )
+
+    def _directors_done(self, summary):
+        self.refresh_keep_position()
+        self._fit_column(DIRECTOR_COLUMN)  # the column was empty until now
+        fetched = summary["fetched"]
+        noun = "movie" if fetched == 1 else "movies"
+        if summary["error"]:
+            QMessageBox.warning(
+                self, "Get Directors",
+                f"{summary['error']}\n\nDirectors saved this time: {fetched}. "
+                f"Still to do: {summary['remaining']}.",
+            )
+        elif summary["cancelled"]:
+            self._flash_status(
+                f"Stopped. Directors saved for {fetched} {noun}; {summary['remaining']} still to do."
+            )
+        else:
+            text = f"Directors saved for {fetched} {noun}."
+            if summary["missing"]:
+                text += f" {summary['missing']} pages named no director (they'll be retried next time)."
+            self._flash_status(text)
+
     def _rescan_done(self, seconds):
         self.last_scan_seconds = seconds
         self._after_data_change()
@@ -1024,6 +1252,7 @@ class MainWindow(QMainWindow):
     def _set_task_ui(self, running):
         self.rescan_action.setEnabled(not running)
         self.plex_action.setEnabled(not running)
+        self.directors_action.setEnabled(not running)
         self.task_label.setText(f"{self._task_text}..." if running else "")
         self.task_progress.setRange(0, 0)  # "busy" animation until real numbers arrive
         for widget in (self.task_label, self.task_progress, self.cancel_button):
@@ -1080,7 +1309,7 @@ class MainWindow(QMainWindow):
             return False, None
 
     def _selected_file_rows(self):
-        """Selected file rows as (movie_id, path, size, confirmed) tuples.
+        """Selected file rows as (movie_id, path, size, confirmed, deconfirmed).
 
         A selected movie row counts as its file when it has exactly one;
         a movie with several files makes you pick the one you mean.
@@ -1114,9 +1343,28 @@ class MainWindow(QMainWindow):
         else:
             self._set_confirmed([row for row in rows if not row[3]], confirm=True)
 
+    def toggle_deconfirm_selected(self):
+        """Backspace: mark the selected files "not this movie", or restore them
+        if they all already are. (A confirmed file is un-confirmed first.)"""
+        if self.scope_key() == "unmatched":
+            self._flash_status(
+                "Unmatched files aren't matched to a movie yet, so there's nothing to deconfirm."
+            )
+            return
+        rows = self._selected_file_rows()
+        if not rows:
+            self._flash_status(
+                "Select a file row first (for a movie with several files, pick the one you mean)."
+            )
+            return
+        if all(row[4] for row in rows):
+            self._set_deconfirmed(rows, deconfirm=False)
+        else:
+            self._set_deconfirmed([row for row in rows if not row[4]], deconfirm=True)
+
     def _set_confirmed(self, rows, confirm):
-        """Confirm or un-confirm `rows` ((movie_id, path, size, confirmed) tuples)."""
-        items = [(movie_id, path, size) for movie_id, path, size, _ in rows]
+        """Confirm or un-confirm `rows` (tuples from _selected_file_rows)."""
+        items = [(row[0], row[1], row[2]) for row in rows]
         action = links.confirm_files if confirm else links.unconfirm_files
         ok, count = self._write_links(lambda conn: action(conn, items))
         if not ok:
@@ -1125,6 +1373,20 @@ class MainWindow(QMainWindow):
         verb = "Confirmed" if confirm else "Removed confirmation from"
         self.refresh_keep_position()
         self._flash_status(f"{verb} {count} {noun}.")
+
+    def _set_deconfirmed(self, rows, deconfirm):
+        """Deconfirm or restore `rows` (tuples from _selected_file_rows)."""
+        items = [(row[0], row[1], row[2]) for row in rows]
+        action = links.deconfirm_files if deconfirm else links.undeconfirm_files
+        ok, count = self._write_links(lambda conn: action(conn, items))
+        if not ok:
+            return
+        noun = "file" if count == 1 else "files"
+        self.refresh_keep_position()
+        if deconfirm:
+            self._flash_status(f"Deconfirmed {count} {noun}.")
+        else:
+            self._flash_status(f"Restored {count} {noun} (no longer deconfirmed).")
 
     def _on_item_activated(self, item, _column):
         """Enter / double-click: in the Unmatched files tab, link that file."""
@@ -1255,12 +1517,17 @@ class MainWindow(QMainWindow):
                 # otherwise the best-effort search.
                 QDesktopServices.openUrl(QUrl(letterboxd_link or letterboxd_url(title, year)))
         elif file_path:
-            confirm_info = item.data(0, Qt.UserRole + 2)    # (movie_id, path, size, confirmed)
+            # (movie_id, path, size, confirmed, deconfirmed) on movie file rows
+            confirm_info = item.data(0, Qt.UserRole + 2)
             unmatched_info = item.data(0, Qt.UserRole + 3)  # (path, size), Unmatched tab only
-            confirm_action = link_action = None
+            confirm_action = deconfirm_action = link_action = None
             if confirm_info:
                 confirm_action = menu.addAction(
                     "Remove confirmation" if confirm_info[3] else "Confirm this file"
+                )
+                deconfirm_action = menu.addAction(
+                    "Restore (remove deconfirmation)" if confirm_info[4]
+                    else "Deconfirm (not this movie)"
                 )
             if unmatched_info:
                 link_action = menu.addAction("Link to movie...")
@@ -1274,6 +1541,8 @@ class MainWindow(QMainWindow):
                 return
             if chosen == confirm_action:
                 self._set_confirmed([confirm_info], confirm=not confirm_info[3])
+            elif chosen == deconfirm_action:
+                self._set_deconfirmed([confirm_info], deconfirm=not confirm_info[4])
             elif chosen == link_action:
                 if not item.isSelected():
                     self.tree.setCurrentItem(item)
@@ -1308,6 +1577,23 @@ class MainWindow(QMainWindow):
         for action in (zoom_in, zoom_out, zoom_reset):
             view_menu.addAction(action)
 
+        view_menu.addSeparator()
+        # A translucent green box around each confirmed file in the list.
+        self.highlight_action = QAction("Highlight &confirmed files", self)
+        self.highlight_action.setCheckable(True)
+        self.highlight_action.setChecked(True)
+        self.highlight_action.toggled.connect(self._set_highlight_confirmed)
+        view_menu.addAction(self.highlight_action)
+
+        fit_action = QAction("&Fit columns to contents", self)
+        fit_action.triggered.connect(self.fit_columns)
+        view_menu.addAction(fit_action)
+
+    def _set_highlight_confirmed(self, checked):
+        self.tree.highlight_confirmed = checked
+        self.tree.viewport().update()
+        self.schedule_save()
+
     def zoom_in(self):
         self.set_zoom(self.zoom_factor + ZOOM_STEP)
 
@@ -1316,6 +1602,7 @@ class MainWindow(QMainWindow):
 
     def set_zoom(self, factor):
         """Scale every font in the program to `factor` x the normal size."""
+        previous_zoom = self.zoom_factor
         self.zoom_factor = round(max(ZOOM_MIN, min(ZOOM_MAX, factor)), 2)
 
         font = QFont(self.base_font)
@@ -1334,6 +1621,13 @@ class MainWindow(QMainWindow):
 
         # Keep the sidebar wide enough for the larger text.
         self.filter_scroll.setMinimumWidth(int(270 * self.zoom_factor))
+
+        # Columns keep the widths you gave them, so scale them with the text.
+        ratio = self.zoom_factor / previous_zoom if previous_zoom else 1.0
+        if abs(ratio - 1.0) > 0.001:
+            header = self.tree.header()
+            for column in range(header.count()):
+                header.resizeSection(column, int(header.sectionSize(column) * ratio))
 
         # Movie rows have their own (bold) font, so resize it by hand. The
         # tree itself is NOT rebuilt, so your expanded/collapsed rows and

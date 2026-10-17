@@ -13,13 +13,23 @@ How a movie ends up in the results (this is the heart of the filters):
     ticked Plex server, OR "Not found" is ticked and the movie has no
     files at all and isn't on any Plex server.
   * The search box narrows everything by title.
-  * The "scope" (All / Watched / Watchlist / Confirmed) decides which films
+  * The "scope" (All / Watched / Watchlist / Confirmed / Deconfirmed) decides which films
     are even considered before any of the above applies.
 
 Confirmed files (see links.py): a file you confirmed by hand counts as its
 own confidence level, "confirmed", which sits above strong. It is shown when
 the Confirmed box is ticked, whatever the scanner originally thought of it.
 The Confirmed tab ignores the confidence boxes and shows only confirmed files.
+
+Deconfirmed files work the same way in reverse: a file you marked "not this
+movie" has the level "deconfirmed", shown only when that box is ticked (off
+by default, so rejected matches stay out of the way) and in the Deconfirmed
+tab. A movie whose only files are deconfirmed counts as "Not found", and a
+deconfirmed file never appears in the Unmatched files tab.
+
+Directors: the search box matches a movie's title OR its director(s), so
+typing a director's name lists their films. (Directors are filled in by
+directors.py.)
 
 Unmatched files: video files on your drives that no movie has claimed, i.e.
 no confirmed link and no strong or basic match. fetch_unmatched() lists them
@@ -41,12 +51,14 @@ KIND_ORDER = {"local": 0, "network": 1, "remote": 2}
 #   watched   films with at least one dated log (diary entry or rating)
 #   watchlist films on your Letterboxd watchlist
 #   confirmed films with at least one file you confirmed by hand
+#   deconfirmed films with at least one file you marked "not this movie"
 #   unmatched not a list of films at all: video files no movie has claimed
 SCOPES = {
     "all": "All",
     "watched": "Watched",
     "watchlist": "Watchlist",
     "confirmed": "Confirmed",
+    "deconfirmed": "Deconfirmed",
     "unmatched": "Unmatched files",
 }
 
@@ -64,7 +76,8 @@ class FileEntry:
     size_bytes: int | None
     confidence: str       # what the scanner thought: 'strong', 'basic' or 'low'
     place_name: str
-    confirmed: bool = False  # True if you confirmed this file by hand
+    confirmed: bool = False    # True if you confirmed this file by hand
+    deconfirmed: bool = False  # True if you marked it "not this movie"
 
 
 @dataclass
@@ -89,6 +102,7 @@ class MovieEntry:
     first_logged: str | None = None              # earliest log date
     last_logged: str | None = None               # latest log date
     watchlist_added: str | None = None           # date added to the watchlist
+    directors: str | None = None                 # "A, B" (see directors.py)
 
 
 @dataclass
@@ -125,6 +139,12 @@ SORT_OPTIONS = {
     "Title (Z-A)": (lambda m: m.title.casefold(), True),
     "Year (newest first)": (lambda m: (m.year is None, -(m.year or 0), m.title.casefold()), False),
     "Year (oldest first)": (lambda m: (m.year is None, m.year or 0, m.title.casefold()), False),
+    # Groups a director's films together, oldest first. Films with no
+    # director yet sort last.
+    "Director (A-Z)": (
+        lambda m: (not m.directors, (m.directors or "").casefold(), m.year is None, m.year or 0),
+        False,
+    ),
     # Dates are ISO text (YYYY-MM-DD), which sorts correctly as plain text.
     # Newest first uses each film's LATEST log; oldest first uses its EARLIEST.
     # Films with no date at all always sort last in both directions.
@@ -215,6 +235,18 @@ def _load_confirmed(conn):
     }
 
 
+def _load_deconfirmed(conn):
+    """Every deconfirmed file as a set of (movie_id, lowercase name, size)."""
+    if not _table_exists(conn, "deconfirmed_links"):
+        return set()
+    return {
+        (movie_id, name.casefold(), size)
+        for movie_id, name, size in conn.execute(
+            "SELECT movie_id, filename, size_bytes FROM deconfirmed_links"
+        )
+    }
+
+
 # A year or resolution tag marks where the title ends in a typical filename:
 # "Blade.Runner.1982.1080p.mkv" -> "Blade Runner". The separator in front
 # means a title that STARTS with a year ("2001 A Space Odyssey") is kept.
@@ -251,6 +283,8 @@ def count_movies(conn, scope="all"):
             sql = "SELECT COUNT(*) FROM movies WHERE watchlist_added IS NOT NULL"
         elif scope == "confirmed":
             sql = "SELECT COUNT(DISTINCT movie_id) FROM confirmed_links"
+        elif scope == "deconfirmed":
+            sql = "SELECT COUNT(DISTINCT movie_id) FROM deconfirmed_links"
         else:
             sql = "SELECT COUNT(*) FROM movies"
         return conn.execute(sql).fetchone()[0]
@@ -266,17 +300,26 @@ def _table_exists(conn, name):
 
 
 def _load_movie_rows(conn):
-    """(id, title, year, letterboxd_url, watchlist_added) for every film.
+    """(id, title, year, letterboxd_url, watchlist_added, directors) per film.
 
-    Falls back to the older, smaller layout if database.py hasn't been
-    re-run yet, so the app still opens (just without the newer fields).
+    Falls back to older, smaller layouts if the database hasn't been
+    upgraded yet, so the app still opens (just without the newer fields).
     """
     try:
         return conn.execute(
-            "SELECT id, title, year, letterboxd_url, watchlist_added FROM movies"
+            "SELECT id, title, year, letterboxd_url, watchlist_added, directors FROM movies"
         ).fetchall()
     except sqlite3.OperationalError:
-        return [(i, t, y, None, None) for i, t, y in conn.execute("SELECT id, title, year FROM movies")]
+        pass
+    try:
+        return [
+            (*row, None)
+            for row in conn.execute(
+                "SELECT id, title, year, letterboxd_url, watchlist_added FROM movies"
+            )
+        ]
+    except sqlite3.OperationalError:
+        return [(i, t, y, None, None, None) for i, t, y in conn.execute("SELECT id, title, year FROM movies")]
 
 
 def _load_logs(conn):
@@ -306,14 +349,18 @@ def fetch_results(
 ):
     """Return the list of MovieEntry objects matching the current filters.
 
-    `confidences` may include "confirmed" (see the module docstring).
+    `confidences` may include "confirmed" and "deconfirmed" (see the module
+    docstring).
     """
     confirmed = _load_confirmed(conn)
     confirmed_movie_ids = {movie_id for movie_id, _, _ in confirmed}
+    deconfirmed = _load_deconfirmed(conn)
+    deconfirmed_movie_ids = {movie_id for movie_id, _, _ in deconfirmed}
 
-    # The Confirmed tab shows confirmed files only, whatever the boxes say.
-    if scope == "confirmed":
-        confidences = ["confirmed"]
+    # The Confirmed and Deconfirmed tabs show only those files, whatever the
+    # confidence boxes say.
+    if scope in ("confirmed", "deconfirmed"):
+        confidences = [scope]
         include_not_found = False
         remote_place_ids = []
 
@@ -321,8 +368,8 @@ def fetch_results(
     needle = _fold(search)
     logs_by_movie = _load_logs(conn)
     movies = {}
-    for movie_id, title, year, url, watchlist_added in _load_movie_rows(conn):
-        if not needle or needle in _fold(title):
+    for movie_id, title, year, url, watchlist_added, directors in _load_movie_rows(conn):
+        if not needle or needle in _fold(title) or (directors and needle in _fold(directors)):
             logs = logs_by_movie.get(movie_id, [])
             dated = [log.logged_date for log in logs if log.logged_date]
             # A film with no logs falls back to the date it joined the watchlist.
@@ -331,6 +378,8 @@ def fetch_results(
 
             # Scope: which films are considered at all.
             if scope == "confirmed" and movie_id not in confirmed_movie_ids:
+                continue
+            if scope == "deconfirmed" and movie_id not in deconfirmed_movie_ids:
                 continue
             if scope == "watched" and not logs:
                 continue
@@ -342,16 +391,17 @@ def fetch_results(
             movies[movie_id] = MovieEntry(
                 movie_id, title, year,
                 letterboxd_url=url, logs=logs, first_logged=first, last_logged=last,
-                watchlist_added=watchlist_added,
+                watchlist_added=watchlist_added, directors=directors,
             )
 
     excluded = [_norm_path(folder) for folder in excluded_folders]
 
     # 2. Visible files: right confidence, right place, not in an excluded
-    #    folder. A confirmed file counts as "confirmed" instead of the
-    #    confidence the scanner gave it.
-    scanned = [c for c in confidences if c != "confirmed"]
+    #    folder. A confirmed (or deconfirmed) file counts as that instead of
+    #    the confidence the scanner gave it.
+    scanned = [c for c in confidences if c not in ("confirmed", "deconfirmed")]
     want_confirmed = "confirmed" in confidences
+    want_deconfirmed = "deconfirmed" in confidences
     # The query only has to be a superset; the exact rule is applied below.
     conditions = []
     params = []
@@ -360,6 +410,8 @@ def fetch_results(
         params += scanned
     if want_confirmed and confirmed_movie_ids:
         conditions.append("l.movie_id IN (SELECT movie_id FROM confirmed_links)")
+    if want_deconfirmed and deconfirmed_movie_ids:
+        conditions.append("l.movie_id IN (SELECT movie_id FROM deconfirmed_links)")
     if conditions and local_place_ids:
         sql = (
             "SELECT l.movie_id, l.path, l.size_bytes, l.confidence, p.name "
@@ -375,9 +427,16 @@ def fetch_results(
                 continue
             name, _ = _identity(path, size)
             is_confirmed = (movie_id, name, size) in confirmed
-            if (want_confirmed if is_confirmed else confidence in scanned):
+            is_deconfirmed = (movie_id, name, size) in deconfirmed
+            if is_confirmed:
+                visible = want_confirmed
+            elif is_deconfirmed:
+                visible = want_deconfirmed
+            else:
+                visible = confidence in scanned
+            if visible:
                 movies[movie_id].files.append(
-                    FileEntry(path, size, confidence, place_name, is_confirmed)
+                    FileEntry(path, size, confidence, place_name, is_confirmed, is_deconfirmed)
                 )
 
     # 3. Plex availability on the ticked servers (if that table exists yet).
@@ -396,6 +455,13 @@ def fetch_results(
     not_found_ids = set()
     if include_not_found:
         has_files = {row[0] for row in conn.execute("SELECT DISTINCT movie_id FROM locations")}
+        # A movie whose only files are ones you deconfirmed has no real files.
+        for movie_id in deconfirmed_movie_ids & has_files:
+            rows = conn.execute(
+                "SELECT path, size_bytes FROM locations WHERE movie_id = ?", (movie_id,)
+            ).fetchall()
+            if all((movie_id, *_identity(path, size)) in deconfirmed for path, size in rows):
+                has_files.discard(movie_id)
         on_servers = set()
         if has_remote_table:
             on_servers = {row[0] for row in conn.execute("SELECT DISTINCT movie_id FROM remote_availability")}
@@ -439,8 +505,8 @@ def has_file_catalog(conn):
 def fetch_unmatched(conn, search, local_place_ids, excluded_folders):
     """Video files on the ticked drives that no movie has claimed.
 
-    "Claimed" means: confirmed by you, or found as a strong or basic match
-    for some movie. (Low matches don't count: short titles produce piles of
+    "Claimed" means: confirmed or deconfirmed by you, or found as a strong or
+    basic match for some movie. (Low matches don't count: short titles produce piles of
     junk low matches, and a file only matched that way is effectively
     unmatched.) The search text narrows by path.
     """
@@ -455,7 +521,11 @@ def fetch_unmatched(conn, search, local_place_ids, excluded_folders):
             "SELECT path FROM locations WHERE confidence IN ('strong', 'basic')"
         )
     }
-    confirmed_files = {(name, size) for _, name, size in _load_confirmed(conn)}
+    # Files you confirmed, or deconfirmed (rejected) for any movie, are
+    # settled: they don't belong in a list of files still needing a home.
+    decided_files = {
+        (name, size) for _, name, size in (_load_confirmed(conn) | _load_deconfirmed(conn))
+    }
 
     sql = (
         "SELECT d.path, d.size_bytes, p.name "
@@ -465,7 +535,7 @@ def fetch_unmatched(conn, search, local_place_ids, excluded_folders):
     )
     results = []
     for path, size, place_name in conn.execute(sql, list(local_place_ids)):
-        if path.casefold() in claimed_paths or _identity(path, size) in confirmed_files:
+        if path.casefold() in claimed_paths or _identity(path, size) in decided_files:
             continue
         if _is_excluded(path, excluded):
             continue
